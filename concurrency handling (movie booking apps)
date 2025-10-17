@@ -1,0 +1,226 @@
+# 🎟️ Concurrency Handling in a Movie Booking System (BookMyShow-style)
+
+## 🧠 Problem Overview
+
+In a movie ticket booking system, **many users try to book the same seat simultaneously**.  
+We must ensure:
+- No two users can book the same seat.
+- System remains responsive and scalable.
+- Users don’t “hoard” seats indefinitely.
+
+This leads to the core challenge — **Concurrency Control**.
+
+---
+
+## ⚔️ The Challenge: Race Condition
+
+If two users click on the same seat at nearly the same time:
+
+1. **Both read:** seat A1 → “AVAILABLE”  
+2. **Both attempt to book** → if not controlled, both may succeed  
+3. ❌ **Inconsistent state:** same seat booked twice
+
+To avoid this, we use **locking mechanisms**.
+
+---
+
+## 🔒 Locking Approaches
+
+### 1️⃣ Pessimistic Locking
+
+#### 🧩 Concept
+> Lock the seat immediately so no other user can even attempt to modify it until the first user finishes.
+
+This relies on **database-level row locks**.
+
+#### 🧠 When to Use
+- Conflicts are **frequent**.
+- **Data integrity** is more critical than throughput.
+- Typical in banking, inventory systems.
+
+#### ⚙️ Example Flow
+
+**User A:**
+```sql
+BEGIN;
+SELECT * FROM show_seat WHERE show_id=55 AND seat_id='A1' FOR UPDATE;
+UPDATE show_seat SET status='LOCKED' WHERE seat_id='A1';
+-- do checkout/payment
+COMMIT;
+User B:
+
+sql
+Copy code
+SELECT * FROM show_seat WHERE seat_id='A1' FOR UPDATE;
+-- Waits until User A commits or rolls back
+✅ Characteristics
+Aspect	Behavior
+Lock location	Database row (transaction-based)
+Duration	Until commit or rollback
+If user abandons	Lock stays until DB closes session
+Expiry mechanism	None (handled by DB timeout)
+Blocking	Yes — other users wait
+Cleanup	Auto on commit/rollback or disconnect
+
+🧱 Example (Pseudocode)
+python
+Copy code
+def book_seat_pessimistic(show_id, seat_id, user_id):
+    conn = db.connect()
+    try:
+        conn.begin()
+        seat = conn.query("SELECT * FROM show_seat WHERE show_id=? AND seat_id=? FOR UPDATE", [show_id, seat_id])
+        if seat.status != "AVAILABLE":
+            conn.rollback()
+            return "Seat not available"
+        
+        conn.execute("UPDATE show_seat SET status='LOCKED', locked_by=? WHERE show_id=? AND seat_id=?", [user_id, show_id, seat_id])
+        payment_success = process_payment(user_id)
+        if payment_success:
+            conn.execute("UPDATE show_seat SET status='BOOKED' WHERE show_id=? AND seat_id=?", [show_id, seat_id])
+            conn.commit()
+            return "Booking confirmed"
+        else:
+            conn.rollback()
+            return "Payment failed, seat released"
+    finally:
+        conn.close()  # releases lock if any
+⚠️ Drawbacks
+Slower under high concurrency.
+
+Users can block others even if idle.
+
+No time-based expiry unless managed externally.
+
+💡 Lock Cleanup Handling
+Database auto-releases locks if:
+
+Connection closes
+
+Transaction commits or rolls back
+
+Optionally set timeouts:
+
+sql
+Copy code
+SET lock_timeout = '5s';
+Always wrap in try/finally to ensure rollback & close connections.
+
+2️⃣ Optimistic Locking
+🧩 Concept
+Allow multiple users to read data freely, but before updating, verify that the data wasn’t changed by someone else.
+
+Uses a version field or timestamp to detect conflicts.
+
+⚙️ Example Flow
+Initial Read:
+Both User A and User B read:
+
+sql
+Copy code
+SELECT seat_id, status, version FROM show_seat WHERE seat_id='A1';
+-- status='AVAILABLE', version=1
+Update Attempt:
+
+sql
+Copy code
+UPDATE show_seat
+SET status='LOCKED', version=version+1, locked_by='user_A', lock_expiry_time=NOW() + INTERVAL '5 MIN'
+WHERE seat_id='A1' AND version=1 AND status='AVAILABLE';
+User A executes first → success
+
+User B executes next → fails (version mismatch)
+
+User B sees: “Seat already taken.”
+
+🧱 Example (Pseudocode)
+python
+Copy code
+def lock_seat_optimistic(show_id, seat_id, user_id):
+    seat = db.query("SELECT status, version FROM show_seat WHERE show_id=? AND seat_id=?", [show_id, seat_id])
+    if seat.status != "AVAILABLE":
+        return "Seat not available"
+
+    rows = db.execute("""
+        UPDATE show_seat
+        SET status='LOCKED', locked_by=?, lock_expiry_time=?, version=version+1
+        WHERE show_id=? AND seat_id=? AND version=? AND status='AVAILABLE'
+    """, [user_id, now() + 5*MIN, show_id, seat_id, seat.version])
+    
+    if rows == 1:
+        return "Seat locked successfully"
+    else:
+        return "Seat already taken"
+🧠 Handling Idle Users (Lock Expiry)
+If user doesn’t complete payment, lock expires after lock_expiry_time.
+
+Background job releases expired locks:
+
+sql
+Copy code
+UPDATE show_seat
+SET status='AVAILABLE', locked_by=NULL
+WHERE status='LOCKED' AND lock_expiry_time < NOW();
+User attempting to pay after expiry → redirected to seat selection.
+
+⚙️ Example User Flow
+Time	User A	User B	Seat Status
+0 min	Selects seat	—	LOCKED (A)
+2 min	On checkout	Tries → Unavailable	LOCKED (A)
+5 min	Still idle	—	Lock expires
+6 min	Tries to pay → “Session expired”	Can book now	AVAILABLE
+
+✅ Characteristics
+Aspect	Behavior
+Lock type	Soft lock via DB field (not transaction lock)
+Lock duration	Fixed (e.g., 5 min)
+Expiry	Time-based auto release
+Blocking	None
+Scalability	Excellent for high concurrency
+Conflict detection	Version check
+
+🔍 Comparison Summary
+Feature	Pessimistic Locking	Optimistic Locking
+Lock acquisition	Immediate (DB row)	On update (soft lock)
+Blocking	Yes	No
+Expiry	None (transaction ends)	Time-based (e.g., 5 min)
+Data consistency	Strong	Eventual (retry mechanism)
+Scalability	Low	High
+Failure handling	Auto rollback on disconnect	Background cleanup
+Typical use	Financial systems	Ticketing, e-commerce
+
+🧩 Hybrid Approach (Used in Production)
+Real-world systems like BookMyShow use a combination:
+
+Optimistic Lock during seat selection.
+
+Short “pessimistic-style” hold using Redis TTL during checkout.
+
+Cleanup job for expired locks.
+
+Final confirmation marks seat as permanently BOOKED.
+
+🧠 Key Takeaways
+Pessimistic Locking = “I’ll block everyone else until I’m done.”
+
+Optimistic Locking = “Everyone can try, but I’ll check before saving.”
+
+Always include timeouts and cleanup logic to prevent seat hoarding.
+
+Distributed systems prefer Redis-based locks or version control over database row locks.
+
+🖼 Diagram Placeholders
+text
+Copy code
+Timeline: User A vs User B
+[0 min] A selects → LOCKED
+[1-4 min] B tries → waits (pessimistic) / fails (optimistic)
+[5 min] Lock expires → seat AVAILABLE
+[6 min] A tries pay → session expired
+[6+ min] B can book
+
+Database Flow:
+[Read] → [Version check / FOR UPDATE] → [Update] → [Commit / Rollback] → [Lock released]
+
+Redis TTL Flow (Hybrid):
+LOCKED → TTL countdown → EXPIRE → seat AVAILABLE
