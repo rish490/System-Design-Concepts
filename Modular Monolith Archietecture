@@ -1,0 +1,89 @@
+-------------------------------
+          MODULAR MONOLITH
+-------------------------------
+
+1️⃣ Definition:
+- Single deployable app
+- Internally split into modules (by business domain)
+- Modules communicate via interfaces/events
+- Easier maintenance & future microservices migration
+
+2️⃣ Core Principles:
+- Encapsulation → module owns logic & data
+- High cohesion, low coupling
+- Clear boundaries
+- Single deployment
+
+3️⃣ Module Architecture (Layers):
+  /domain       → business entities & logic
+  /application  → use case orchestration
+  /infrastructure → DB, APIs, messaging
+  /api          → module interface / endpoints
+
+4️⃣ Folder Structure Example:
+src/
+ ├─ modules/
+ │   ├─ users/
+ │   │   ├─ domain/
+ │   │   ├─ application/
+ │   │   ├─ infrastructure/
+ │   │   └─ api/
+ │   ├─ orders/ ...
+ ├─ shared/
+ │   ├─ utils/
+ │   └─ events/
+ └─ config/
+     main.js
+
+5️⃣ Module Communication:
+- Use interfaces / service methods
+- Publish domain events
+- Avoid accessing another module’s internals
+- Goal → loose coupling
+
+6️⃣ Scalability:
+- Vertical → bigger machine (CPU/RAM)
+- Horizontal → multiple app instances behind load balancer
+- Optimize hot modules → caching, async jobs, background workers
+
+7️⃣ Downtime Handling:
+- Single deployable → whole app affected if crashes
+- Zero-Downtime Deployments:
+  a) Rolling → update instances gradually
+  b) Blue-Green → new env, switch traffic instantly
+  c) Canary → small user group first, monitor, expand
+- Module-level error handling to contain failures
+
+8️⃣ Pros:
+- Structured, maintainable
+- Faster development than microservices
+- Can evolve into microservices later
+- No network overhead internally
+
+9️⃣ Cons:
+- Can't scale modules independently
+- Single point of failure
+- Shared DB risks
+- Needs discipline for strict boundaries
+
+10️⃣ Best Practices:
+- Align modules with business domains
+- Keep shared code minimal
+- Use interfaces/events for inter-module communication
+- Keep stateless for horizontal scaling
+- Monitor modules individually
+
+11️⃣ Transition to Microservices:
+- Each module → separate service
+- Domain & infra reusable
+- Events → inter-service communication
+- Ideal when independent scaling needed
+
+-------------------------------
+KEY TAKEAWAYS:
+- Single deployable + modular internal structure
+- Clear boundaries = maintainable & refactorable
+- Horizontal scaling via multiple instances
+- Zero-downtime deployment: Rolling / Blue-Green / Canary
+- Modules = business domains
+-------------------------------
