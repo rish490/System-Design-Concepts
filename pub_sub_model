@@ -1,0 +1,299 @@
+Code
+#include <iostream>
+#include <string>
+#include <vector>
+#include <unordered_map>
+
+// ----------------- Message -----------------
+class Message {
+public:
+    Message(const std::string& payload) : payload(payload) {}
+    std::string getPayload() const { return payload; }
+private:
+    std::string payload;
+};
+
+// ----------------- Consumer Interface -----------------
+class Consumer {
+public:
+    virtual void onMessage(const Message& message) = 0;
+    virtual ~Consumer() = default;
+};
+
+// ----------------- Subscription -----------------
+class Subscription {
+public:
+    Subscription(Consumer* consumer) : consumer(consumer), offset(0) {}
+    Consumer* getConsumer() { return consumer; }
+    int getOffset() const { return offset; }
+    void incrementOffset() { offset++; }
+private:
+    Consumer* consumer;
+    int offset; // tracks last consumed message
+};
+
+// ----------------- Topic -----------------
+class Topic {
+public:
+    Topic(const std::string& name) : name(name) {}
+
+    void publish(const Message& message) {
+        messages.push_back(message);
+        dispatch();
+    }
+
+    void addSubscription(Subscription* subscription) {
+        subscriptions.push_back(subscription);
+    }
+
+private:
+    std::string name;
+    std::vector<Message> messages;
+    std::vector<Subscription*> subscriptions;
+
+    void dispatch() {
+        for (auto sub : subscriptions) {
+            int offset = sub->getOffset();
+            if (offset < messages.size()) {
+                sub->getConsumer()->onMessage(messages[offset]);
+                sub->incrementOffset();
+            }
+        }
+    }
+};
+
+// ----------------- Broker -----------------
+class Broker {
+public:
+    void createTopic(const std::string& name) {
+        if (topics.find(name) == topics.end()) {
+            topics[name] = new Topic(name);
+        }
+    }
+
+    void subscribe(const std::string& topicName, Consumer* consumer) {
+        createTopic(topicName);
+        topics[topicName]->addSubscription(new Subscription(consumer));
+    }
+
+    void publish(const std::string& topicName, const std::string& payload) {
+        createTopic(topicName);
+        topics[topicName]->publish(Message(payload));
+    }
+
+private:
+    std::unordered_map<std::string, Topic*> topics;
+};
+
+// ----------------- Example Consumer -----------------
+class PrintConsumer : public Consumer {
+public:
+    void onMessage(const Message& message) override {
+        std::cout << "Received: " << message.getPayload() << std::endl;
+    }
+};
+
+// ----------------- Main / Usage -----------------
+int main() {
+    Broker broker;
+
+    PrintConsumer c1;
+    PrintConsumer c2;
+
+    broker.subscribe("order_created", &c1);
+    broker.subscribe("order_created", &c2);
+
+    broker.publish("order_created", "Order #101 created");
+    broker.publish("order_created", "Order #102 created");
+
+    return 0;
+}
+
+
+
+Producer–Consumer & Pub-Sub: Conceptual Summary
+What problem does a Messaging Queue solve?
+
+A messaging queue enables asynchronous communication between systems by decoupling message producers from message consumers.
+
+Instead of calling each other directly, systems communicate via a broker, which improves:
+
+Reliability
+
+Scalability
+
+Fault tolerance
+
+Independent evolution of services
+
+Core Concepts
+1. Producer
+
+A producer is any component that creates and publishes messages.
+
+It sends messages to a topic
+
+It does not know who consumes the message
+
+It does not wait for consumers to process the message
+
+Example:
+
+Order Service publishing an order_created event
+
+2. Consumer
+
+A consumer is any component that subscribes to a topic and processes messages.
+
+Multiple consumers can subscribe to the same topic
+
+Each consumer processes messages independently
+
+Consumers can be added or removed without changing producer code
+
+Example:
+
+Email Service, Analytics Service, Inventory Service
+
+3. Message
+
+A message represents a single event occurrence.
+
+Immutable data
+
+Contains payload + metadata
+
+Example: Order #123 created
+
+4. Topic
+
+A topic represents a stream (category) of related events, not a single event.
+
+Long-lived entity
+
+Holds many messages over time
+
+Typically named after the event type
+
+Example:
+
+Topic: order_created
+Messages:
+- Order #101 created
+- Order #102 created
+- Order #103 created
+
+
+Key distinction:
+
+Event → single occurrence
+
+Topic → continuous stream of similar events
+
+5. Pub-Sub (Publish–Subscribe Model)
+
+In the pub-sub model:
+
+Producers publish messages to a topic
+
+Consumers subscribe to a topic
+
+The producer is completely unaware of consumers
+
+The broker manages delivery
+
+Producer → Broker / Topic → Consumer A
+                         → Consumer B
+
+
+This provides loose coupling between producers and consumers.
+
+6. Broker
+
+The broker is the central component that:
+
+Maintains topics
+
+Stores messages
+
+Tracks subscriptions
+
+Delivers messages to consumers
+
+Examples:
+
+Kafka
+
+RabbitMQ
+
+AWS SNS/SQS
+
+ActiveSupport::Notifications (Rails)
+
+7. Offset (High-level)
+
+Each consumer keeps track of where it is in the message stream.
+
+Allows independent consumption
+
+Enables replay and recovery
+
+Prevents consumers from interfering with each other
+
+Why Producers Don’t Know Consumers (Key Insight)
+
+Producers only:
+
+Know the topic name
+
+Call publish(topic, message)
+
+They do not:
+
+Track consumers
+
+Call consumer APIs
+
+Care how many consumers exist
+
+All routing logic lives in the broker.
+
+This is the essence of decoupling.
+
+Benefits of This Design
+
+Loose coupling between services
+
+Easy to add/remove consumers
+
+Better fault tolerance
+
+Supports event-driven architecture
+
+Scales independently on producer and consumer side
+
+One-Line Interview Definition
+
+A messaging queue implements asynchronous communication where producers publish events to topics and consumers subscribe independently, with the broker handling delivery and decoupling both sides.
+
+When to Use a Messaging Queue
+
+Event-driven systems
+
+Background processing
+
+Notifications
+
+Analytics
+
+Distributed systems communication
+
+Mental Model
+
+Producer → emits facts
+
+Topic → pipeline of similar facts
+
+Broker → traffic controller
+
+Consumer → reacts to facts
