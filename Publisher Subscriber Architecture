@@ -297,3 +297,89 @@ Topic → pipeline of similar facts
 Broker → traffic controller
 
 Consumer → reacts to facts
+
+
+
+BASIC CODE IF INTERVIEWER ASKS TO CODE 
+
+
+#include <iostream>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <string>
+
+/* -------------------- Message -------------------- */
+class Message {
+public:
+    int id;
+    std::string payload;
+
+    Message(int id, const std::string& payload)
+        : id(id), payload(payload) {}
+};
+
+/* -------------------- Message Queue -------------------- */
+class MessageQueue {
+private:
+    std::queue<Message> queue;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+public:
+    // Producer API
+    void publish(const Message& message) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            queue.push(message);
+        }
+        // Notify one waiting consumer
+        cv.notify_one();
+    }
+
+    // Consumer API (blocking)
+    Message consume() {
+        std::unique_lock<std::mutex> lock(mtx);
+
+        // Wait until queue has at least one message
+        cv.wait(lock, [this]() {
+            return !queue.empty();
+        });
+
+        Message msg = queue.front();
+        queue.pop();
+        return msg;
+    }
+};
+
+/* -------------------- Producer -------------------- */
+void producer(MessageQueue& mq) {
+    for (int i = 1; i <= 5; i++) {
+        Message msg(i, "Message " + std::to_string(i));
+        std::cout << "[Producer] Publishing: " << msg.payload << std::endl;
+        mq.publish(msg);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
+/* -------------------- Consumer -------------------- */
+void consumer(MessageQueue& mq) {
+    for (int i = 1; i <= 5; i++) {
+        Message msg = mq.consume();
+        std::cout << "[Consumer] Consumed: " << msg.payload << std::endl;
+    }
+}
+
+/* -------------------- Main -------------------- */
+int main() {
+    MessageQueue mq;
+
+    std::thread prod(producer, std::ref(mq));
+    std::thread cons(consumer, std::ref(mq));
+
+    prod.join();
+    cons.join();
+
+    return 0;
+}
