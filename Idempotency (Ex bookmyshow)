@@ -1,0 +1,148 @@
+/*
+========================================================================
+BookMyShow Booking Service with Idempotency (Backend-Generated Key)
+========================================================================
+
+REAL-WORLD PROBLEM:
+
+1. Network unreliability:
+   - Client sends booking request
+   - Server processes it (reserves seats, creates booking)
+   - Response is lost due to timeout, packet loss, or app crash
+   - Client retries request
+
+2. Without idempotency:
+   - Retry request creates a new booking
+   - Seats may be double-booked
+   - Payment may be charged twice
+   - Leads to inconsistency and poor user experience
+
+3. Concurrency concern:
+   - Multiple users trying to book the same seat
+   - Handled separately via seat-level locks or database optimistic/pessimistic locking
+
+SOLUTION IMPLEMENTED IN THIS CODE:
+
+1. Backend-generated idempotency key:
+   - Combines userId, showId, seatIds to generate a unique key per request
+   - Key stored in server-side idempotencyStore
+   - Ensures same request returns same booking
+
+2. Booking flow:
+   - Generate backend key
+   - Check if key exists in idempotencyStore:
+       -> If yes: return previous booking (safe retry)
+       -> If no: reserve seats and create new booking
+
+3. Guarantees:
+   - Retry safe: same booking returned
+   - No duplicate seat reservation
+   - Handles lost response scenario in distributed systems
+
+========================================================================
+*/
+
+#include <iostream>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <stdexcept>
+#include <string>
+#include <sstream>
+#include <functional>
+
+using namespace std;
+
+// -------------------- ENTITIES --------------------
+class Booking {
+public:
+    int bookingId;
+    int userId;
+    int showId;
+    vector<int> seatIds;
+};
+
+// Simple seat manager (handles concurrency via mutex in real system)
+class ShowSeatManager {
+private:
+    unordered_map<int, unordered_set<int>> bookedSeats; // showId -> seatIds
+public:
+    bool bookSeats(int showId, const vector<int>& seatIds) {
+        for (int s : seatIds) {
+            if (bookedSeats[showId].count(s)) return false; // seat already booked
+        }
+        for (int s : seatIds) bookedSeats[showId].insert(s);
+        return true;
+    }
+};
+
+// -------------------- BOOKING SERVICE --------------------
+class BookingService {
+private:
+    unordered_map<int, Booking> bookings;             // bookingId -> Booking
+    unordered_map<string, int> idempotencyStore;      // idempotencyKey -> bookingId
+    int bookingCounter = 1;
+    ShowSeatManager* seatManager;
+
+    // Backend-generated idempotency key based on parameters
+    string generateIdempotencyKey(int userId, int showId, const vector<int>& seatIds) {
+        stringstream ss;
+        ss << userId << "_" << showId << "_";
+        for (int s : seatIds) ss << s << "-";
+        string raw = ss.str();
+        // Simple hash function for demonstration
+        return to_string(hash<string>{}(raw));
+    }
+
+public:
+    BookingService(ShowSeatManager* manager) : seatManager(manager) {}
+
+    // Idempotent booking API (backend generates key)
+    pair<Booking, string> createBooking(int userId,
+                                       int showId,
+                                       const vector<int>& seatIds) {
+        string idempotencyKey = generateIdempotencyKey(userId, showId, seatIds);
+
+        // Return previous booking if request retried
+        if (idempotencyStore.count(idempotencyKey)) {
+            int bId = idempotencyStore[idempotencyKey];
+            return {bookings[bId], idempotencyKey};
+        }
+
+        // Book seats
+        if (!seatManager->bookSeats(showId, seatIds))
+            throw runtime_error("Seats not available");
+
+        // Create booking
+        Booking b;
+        b.bookingId = bookingCounter++;
+        b.userId = userId;
+        b.showId = showId;
+        b.seatIds = seatIds;
+
+        bookings[b.bookingId] = b;
+        idempotencyStore[idempotencyKey] = b.bookingId;
+
+        return {b, idempotencyKey};
+    }
+};
+
+// -------------------- DEMO --------------------
+int main() {
+    ShowSeatManager seatManager;
+    BookingService bookingService(&seatManager);
+
+    // First booking attempt
+    auto [booking1, key1] = bookingService.createBooking(1, 1, {1,2});
+    cout << "First booking ID: " << booking1.bookingId << ", Idempotency Key: " << key1 << endl;
+
+    // Retry due to lost response (client uses key returned earlier)
+    auto [booking2, key2] = bookingService.createBooking(1, 1, {1,2});
+    cout << "Retry booking ID (same): " << booking2.bookingId << ", Idempotency Key: " << key2 << endl;
+
+    // Another new booking for different seats
+    auto [booking3, key3] = bookingService.createBooking(1, 1, {3,4});
+    cout << "New booking ID: " << booking3.bookingId << ", Idempotency Key: " << key3 << endl;
+
+    return 0;
+}
