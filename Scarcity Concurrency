@@ -1,0 +1,288 @@
+# Scarcity in Low-Level Design
+
+> Managing limited resources when demand exceeds supply.
+
+The constraint is **capacity**, not correctness. You have N threads competing for M resources where M < N. The job is to coordinate the waiting without the system falling over.
+
+---
+
+## TL;DR Decision Tree
+
+```
+Is the resource a stateful object you must hand out (DB connection, GPU)?
+├── YES → Blocking Queue (resource pool)
+└── NO  → Semaphore
+          ├── Each op consumes 1 unit?         → Semaphore with N permits
+          └── Each op consumes variable units? → Semaphore where 1 permit = 1 unit
+```
+
+If utilization (not governance) is the goal → **work stealing**, **batching**, or **adaptive sizing**.
+
+---
+
+## Two Core Solutions
+
+### 1. Semaphore — limit *how many* can do something at once
+
+A counter with `acquire()` / `release()`. Threads block when the counter hits zero, OS wakes them on release. Use it when there is **no actual object to hand out**, just permission.
+
+**Analogy:** Nightclub with 100 tokens. Bouncer hands one out per entry, takes one back per exit.
+
+```cpp
+#include <semaphore>
+#include <string>
+
+class APIClient {
+private:
+    std::counting_semaphore<5> requestPermits{5};
+    HttpClient httpClient;
+
+public:
+    Response makeRequest(const std::string& endpoint) {
+        requestPermits.acquire();
+        try {
+            auto response = httpClient.get(endpoint);
+            requestPermits.release();
+            return response;
+        } catch (...) {
+            requestPermits.release();
+            throw;
+        }
+    }
+};
+```
+
+**Critical rule:** Always release in a `catch` (or RAII guard). Forgetting this is the #1 bug interviewers probe.
+
+#### RAII helper (preferred in real code)
+
+```cpp
+template <std::ptrdiff_t N>
+class SemaphoreGuard {
+    std::counting_semaphore<N>& sem;
+public:
+    explicit SemaphoreGuard(std::counting_semaphore<N>& s) : sem(s) { sem.acquire(); }
+    ~SemaphoreGuard() { sem.release(); }
+    SemaphoreGuard(const SemaphoreGuard&) = delete;
+    SemaphoreGuard& operator=(const SemaphoreGuard&) = delete;
+};
+```
+
+---
+
+### 2. Resource Pool (Blocking Queue) — hand out *the actual object*
+
+When the resource is a stateful, expensive-to-create object (open socket, GPU context, file handle), you need to dispense and reclaim instances. C++ has no built-in blocking queue, so you build one with `std::queue` + `std::mutex` + `std::condition_variable`.
+
+```cpp
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <stdexcept>
+
+class ConnectionPool {
+private:
+    std::queue<Connection*> available;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::chrono::milliseconds timeout;
+
+public:
+    ConnectionPool(int poolSize, std::chrono::milliseconds t)
+        : timeout(t) {
+        for (int i = 0; i < poolSize; ++i) {
+            available.push(createNewConnection());
+        }
+    }
+
+    Connection* acquire() {
+        std::unique_lock<std::mutex> lock(mtx);
+        if (!cv.wait_for(lock, timeout, [this] { return !available.empty(); })) {
+            throw std::runtime_error("No connection available within timeout");
+        }
+        Connection* conn = available.front();
+        available.pop();
+        return conn;
+    }
+
+    void release(Connection* conn) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            available.push(conn);
+        }
+        cv.notify_one();
+    }
+
+    void executeQuery(const std::string& query) {
+        Connection* conn = acquire();
+        try {
+            conn->execute(query);
+            release(conn);
+        } catch (...) {
+            release(conn);
+            throw;
+        }
+    }
+};
+```
+
+**Why a pool, not just a semaphore?** A semaphore caps concurrency but doesn't store the actual `Connection*`. The queue both bounds concurrency *and* dispenses objects.
+
+---
+
+## Production Concerns
+
+| Concern | Fix |
+|---|---|
+| Thread blocks forever on a stuck pool | Use `wait_for` (timeouts), throw on expiry → return 503 |
+| Pool grows unbounded | Cap capacity at construction; never create lazily without bounds |
+| Stale/dead connections | Validate on checkout; discard + replace if dead |
+| Slow startup | Trade-off: upfront init (default) vs. lazy init (race-prone) |
+| Strict fairness | Use FIFO ordering structures; usually approximate FIFO is fine |
+| Exception leaks a permit | Always `release` in `catch` / use RAII guard |
+
+**Timeout heuristic:** typical op time × ~5. If a query is ~100 ms, set timeout to ~500 ms. Always shorter than your upstream load-balancer timeout.
+
+---
+
+## The Four Patterns You'll See in Interviews
+
+### Pattern 1 — Limit Concurrent Operations
+
+> "Limit to N concurrent X." No object to hand out.
+
+Examples: download manager, rate-limited API client, image/video transcoder.
+
+```cpp
+#include <semaphore>
+#include <fstream>
+
+class DownloadManager {
+private:
+    std::counting_semaphore<3> slots{3};
+    HttpClient httpClient;
+
+public:
+    void download(const std::string& url, const std::string& dest) {
+        slots.acquire();
+        try {
+            auto data = httpClient.download(url);
+            std::ofstream file(dest, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(data.data()), data.size());
+            slots.release();
+        } catch (...) {
+            slots.release();
+            throw;
+        }
+    }
+};
+```
+
+---
+
+### Pattern 2 — Limit Aggregate Consumption
+
+> Operations consume *variable amounts* of a shared budget (bandwidth, memory, I/O).
+
+1 permit = 1 unit of resource. Threads acquire permits proportional to what they'll consume.
+
+```cpp
+#include <mutex>
+#include <condition_variable>
+#include <fstream>
+#include <algorithm>
+#include <vector>
+
+class DiskWriter {
+private:
+    static constexpr int MB = 1024 * 1024;
+    std::mutex mtx;
+    std::condition_variable cv;
+    int available = 100; // 100 MB budget
+
+public:
+    void writeFile(const std::vector<char>& data, const std::string& path) {
+        int permits = std::max(1, static_cast<int>((data.size() + MB - 1) / MB));
+
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [this, permits] { return available >= permits; });
+            available -= permits;
+        }
+
+        try {
+            std::ofstream file(path, std::ios::binary);
+            file.write(data.data(), data.size());
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                available += permits;
+            }
+            cv.notify_all();
+            throw;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            available += permits;
+        }
+        cv.notify_all();
+    }
+};
+```
+
+> Note: this caps *concurrent bytes in flight*, not throughput rate. True rate limiting (100 MB/s) needs **token-bucket**-style time-based replenishment.
+
+Examples: in-flight upload limiter, memory budget for buffers.
+
+---
+
+### Pattern 3 — Reuse Expensive Objects
+
+> Stateful objects that are slow/expensive to create (DB connections, GPU contexts, file handles).
+
+→ Use the **blocking queue / resource pool** from Solution 2.
+
+Examples:
+- DB connection pool (10 connections serving 1000 RPS).
+- GPU task scheduler (4 GPUs with pre-loaded model weights).
+
+---
+
+### Pattern 4 — Maximize Utilization
+
+When governance isn't enough — interviewer asks "how do you keep the GPUs/connections fully busy?"
+
+| Technique | When to use | How |
+|---|---|---|
+| **Work stealing** | Task durations vary wildly | Per-worker queues; idle workers steal from busy ones (Java `ForkJoinPool`, Go scheduler) |
+| **Batching** | Many small operations dominate pool overhead | Acquire once, do N units of work, release. Trades latency for throughput |
+| **Adaptive sizing** | Demand fluctuates significantly | Grow pool under load, shrink when idle (HikariCP, pgbouncer). Tune carefully or you thrash |
+
+---
+
+## Predictable Failure Modes
+
+- **Permit leak** — missing `release` on the exception path → pool drains forever.
+- **Unbounded queue** — no capacity argument → OOM.
+- **Indefinite blocking** — `wait()` instead of `wait_for()` on a request path → users see hangs, threads pile up.
+- **Check-then-act without locks** — TOCTOU lets threads exceed the limit.
+- **Stale resources** — connection died during idle; handing it out fails the next request.
+
+---
+
+## Interview Cheat-Sheet Phrases
+
+- "I'll use a semaphore with N permits to cap concurrent operations."
+- "Connections are stateful objects, so I'll use a `BlockingQueue` of `Connection*` — threads `acquire`, use, and `release` in a catch block."
+- "I'll use `wait_for` with a timeout instead of `wait` so request paths fail fast instead of blocking forever."
+- "I'll create connections upfront in the constructor — simpler, no lazy-init race conditions, predictable runtime."
+- "Each operation consumes a variable amount of bandwidth, so 1 permit = 1 MB. Operations acquire permits equal to their size."
+- "To maximize utilization with uneven task lengths, I'd add per-worker queues with work stealing."
+
+---
+
+## One-Line Summary
+
+> **Scarcity = bounded capacity + blocking coordination.** Pick a semaphore for permission, a blocking queue for objects, add timeouts on request paths, always release in a catch block.
