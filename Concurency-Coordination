@@ -1,0 +1,589 @@
+# Coordination — Blocking Queues & Actors (LLD Revision Guide)
+
+A crisp revision guide for coordination problems in concurrent systems. Covers wait/notify, bounded blocking queues, graceful shutdown, the actor model, and real-world producer-consumer patterns.
+
+> **Core idea:** Concurrency correctness is about *who touches what, when*. Coordination is about *how independent threads hand work to each other safely*.
+
+---
+
+## Table of Contents
+
+1. [The Core Problem](#1-the-core-problem)
+2. [Wait / Notify — The Building Blocks](#2-wait--notify--the-building-blocks)
+3. [Bounded Blocking Queue](#3-bounded-blocking-queue)
+4. [Three Strategies When the Queue Is Full](#4-three-strategies-when-the-queue-is-full)
+5. [Graceful Shutdown](#5-graceful-shutdown)
+6. [The Actor Model](#6-the-actor-model)
+7. [Actors vs Blocking Queues — When to Use Which](#7-actors-vs-blocking-queues--when-to-use-which)
+8. [How Actor Frameworks Are Implemented](#8-how-actor-frameworks-are-implemented)
+9. [Real-World Pattern #1 — Async Background Work](#9-real-world-pattern-1--async-background-work)
+10. [Real-World Pattern #2 — Bursty Traffic & Load Shedding](#10-real-world-pattern-2--bursty-traffic--load-shedding)
+11. [Common Mistakes to Avoid](#11-common-mistakes-to-avoid)
+12. [Interview Cheat Sheet](#12-interview-cheat-sheet)
+
+---
+
+## 1. The Core Problem
+
+When multiple threads need to cooperate (one produces work, another consumes it), you need:
+
+- **Thread safety** — multiple threads can't corrupt shared state
+- **Efficient waiting** — idle threads must sleep, not busy-spin
+- **Backpressure** — fast producers must slow down when consumers can't keep up
+- **Clean shutdown** — threads must be able to stop without data loss
+
+Naive solutions (busy-loops, unbounded queues, raw mutex sprinkled everywhere) fail at one or more of these.
+
+---
+
+## 2. Wait / Notify — The Building Blocks
+
+The lowest-level coordination primitive. A thread can:
+
+- **Wait** on a condition variable until some predicate becomes true
+- **Notify** other threads when state changes
+
+```cpp
+std::mutex mtx;
+std::condition_variable cv;
+bool ready = false;
+
+// Thread A — waits
+std::unique_lock<std::mutex> lock(mtx);
+cv.wait(lock, [] { return ready; });   // sleeps efficiently until ready==true
+
+// Thread B — notifies
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    ready = true;
+}
+cv.notify_one();
+```
+
+**Key rules:**
+
+- Always pass a **predicate** to `wait()` — protects against spurious wakeups.
+- Always **hold the mutex** when modifying the predicate's state.
+- Use `notify_one()` for "wake any one waiter," `notify_all()` for broadcasts (e.g., shutdown).
+
+You rarely write this from scratch. You wrap it in a **blocking queue**.
+
+---
+
+## 3. Bounded Blocking Queue
+
+A thread-safe queue with one twist: **it makes threads wait** instead of failing.
+
+| Operation | Normal queue | Blocking queue |
+|---|---|---|
+| Take from empty | Returns null / throws | **Sleeps** until something arrives |
+| Add to full | Fails / grows forever | **Sleeps** until space frees up |
+
+C++ has no standard blocking queue, so you build one with `std::queue`, `std::mutex`, and two condition variables (one for "not empty," one for "not full"):
+
+```cpp
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+
+class TaskScheduler {
+    std::queue<std::function<void()>> queue_;
+    std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+    static constexpr size_t MAX_SIZE = 1000;
+
+public:
+    void submitTask(std::function<void()> task) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_full_.wait(lock, [this] { return queue_.size() < MAX_SIZE; });
+        queue_.push(std::move(task));
+        not_empty_.notify_one();
+    }
+
+    void workerLoop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                not_empty_.wait(lock, [this] { return !queue_.empty(); });
+                task = std::move(queue_.front());
+                queue_.pop();
+                not_full_.notify_one();
+            }
+            task();   // run OUTSIDE the lock — critical!
+        }
+    }
+};
+```
+
+**What you get for free:**
+
+1. **Thread safety** — many producers + many consumers, no corruption
+2. **Backpressure** — fast producers automatically block when consumers fall behind
+3. **Efficient waiting** — idle threads sleep, no CPU burn
+
+**Critical detail:** `task()` runs **outside** the lock. Holding the lock while running tasks would serialize all work and defeat the entire purpose.
+
+**Sizing the queue:**
+
+```
+capacity = expected_throughput × seconds_of_burst_to_absorb
+```
+
+E.g., 100 tasks/sec workers, want to absorb 10s of spike → capacity = 1000.
+
+---
+
+## 4. Three Strategies When the Queue Is Full
+
+You must pick one based on use case:
+
+| Strategy | C++ Method | Behavior | When to use |
+|---|---|---|---|
+| **Block** | `wait()` until space | Producer waits forever | Internal pipelines, batch jobs |
+| **Timeout & reject** | `wait_for(timeout)` → throw | Wait briefly, then fail | **Request paths** — return 503 |
+| **Drop immediately** | check size, return false | Fail instantly | Lossy events (analytics, metrics) |
+
+### Timeout-and-reject pattern (for HTTP APIs):
+
+```cpp
+void enqueueOrReject(Task task) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    bool ok = not_full_.wait_for(lock, std::chrono::milliseconds(100),
+        [this] { return queue_.size() < MAX_SIZE; });
+    if (!ok) {
+        throw std::runtime_error("503: Too many requests, try again");
+    }
+    queue_.push(std::move(task));
+    not_empty_.notify_one();
+}
+```
+
+> **Better to fail 5% of requests in 100ms than to fail 100% of requests in 30 seconds.**
+> This is called **load shedding**.
+
+---
+
+## 5. Graceful Shutdown
+
+Workers blocked in `wait()` will sit there forever. You must wake them up cleanly.
+
+**Why it matters:** Production systems restart constantly (deploys, autoscaling, pod evictions). Without graceful shutdown:
+- In-flight tasks lost
+- Database transactions left open
+- Resources leaked
+- Users see errors instead of clean responses
+
+### Pattern 1: Atomic flag + `notify_all`
+
+```cpp
+class TaskScheduler {
+    std::queue<std::function<void()>> queue_;
+    std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::atomic<bool> running_{true};
+
+public:
+    void shutdown() {
+        running_ = false;
+        not_empty_.notify_all();   // wake every blocked worker
+    }
+
+    void workerLoop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                not_empty_.wait(lock, [this] {
+                    return !queue_.empty() || !running_;
+                });
+                if (!running_ && queue_.empty()) break;   // clean exit
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+            task();
+        }
+    }
+};
+```
+
+Worker wakes up, sees `!running_`, drains remaining tasks, then exits.
+
+### Pattern 2: Poison pill
+
+Submit a sentinel "STOP" task per worker. Each worker exits when it sees one.
+
+```cpp
+struct StopSignal {};
+using QueueItem = std::variant<std::function<void()>, StopSignal>;
+// Worker checks std::holds_alternative<StopSignal>(item) and breaks.
+```
+
+Useful when you can't directly signal threads or want them to finish queued work first.
+
+### Pattern 3: Poll with timeout
+
+Worker waits up to N ms; if nothing arrives, checks shutdown flag. Trades latency for simplicity.
+
+```cpp
+not_empty_.wait_for(lock, std::chrono::seconds(1), [this] { return !queue_.empty(); });
+if (!running_) break;
+```
+
+---
+
+## 6. The Actor Model
+
+A fundamentally different approach: **don't share state at all. Send messages.**
+
+An actor is just three things:
+
+1. A **mailbox** (queue of incoming messages)
+2. A **single-threaded message loop** that processes one message at a time
+3. The ability to **send** messages to other actors
+
+```cpp
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
+
+template<typename T>
+class Actor {
+private:
+    std::queue<T> mailbox_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::atomic<bool> running_{true};
+    std::thread thread_;
+
+public:
+    Actor() : thread_([this] { run(); }) {}
+
+    void send(T message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        mailbox_.push(std::move(message));
+        cv_.notify_one();
+    }
+
+    void stop() {
+        running_ = false;
+        cv_.notify_one();
+        thread_.join();
+    }
+
+protected:
+    virtual void onReceive(T message) = 0;
+
+private:
+    void run() {
+        while (running_) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return !mailbox_.empty() || !running_; });
+            if (!running_ && mailbox_.empty()) break;
+            T msg = std::move(mailbox_.front());
+            mailbox_.pop();
+            lock.unlock();
+            onReceive(std::move(msg));   // runs OUTSIDE the lock
+        }
+    }
+};
+```
+
+**Why this is magical:**
+
+Because `onReceive` only ever runs on **one thread at a time**, the actor's internal state never faces concurrent access. **You can have mutable fields, counters, caches — no locks needed in business logic.**
+
+### Example: chat user as actor
+
+```cpp
+struct Message {
+    enum Type { INCOMING, MARK_READ, GET_STATUS } type;
+    std::string body;
+};
+
+class UserActor : public Actor<Message> {
+    int unreadCount_ = 0;       // no lock needed
+    std::vector<std::string> recent_;
+
+protected:
+    void onReceive(Message m) override {
+        switch (m.type) {
+            case Message::INCOMING:
+                recent_.push_back(m.body);
+                unreadCount_++;
+                break;
+            case Message::MARK_READ:
+                unreadCount_ = 0;
+                break;
+            case Message::GET_STATUS:
+                // ... reply to sender
+                break;
+        }
+    }
+};
+```
+
+No mutex. No race conditions. Synchronization happens only at the mailbox boundary.
+
+---
+
+## 7. Actors vs Blocking Queues — When to Use Which
+
+The decision rule is simple:
+
+> **Does the work have a natural owner?**
+
+| Situation | Use |
+|---|---|
+| "Process these tasks, any worker can handle any task" | **Blocking queue** |
+| "I have many independent entities, each with its own state" | **Actors** |
+
+| Examples |  |
+|---|---|
+| Resize image, send email, generate report | Queue (work has no owner) |
+| Chat user, game room, IoT device, order book | Actor (entity owns its state) |
+
+### Why actors win for stateful entities
+
+With a blocking queue + shared map of users, **every operation contends on one big lock** (or you get tangled into per-user locks with deadlock risk). With actors, **Bob's actor and Carol's actor run truly in parallel** — no contention.
+
+### Trade-offs of actors
+
+| Lose | Gain |
+|---|---|
+| Direct synchronous calls (everything is async) | No locks in business logic |
+| Easy debugging (must trace message flow) | Natural parallelism per entity |
+| Strict global ordering | Easy distribution across machines |
+| Simplicity for plain task processing | Centralized synchronization at one boundary |
+
+---
+
+## 8. How Actor Frameworks Are Implemented
+
+The naive C++ example uses **one OS thread per actor**. That doesn't scale beyond a few thousand actors (~1MB stack each).
+
+Production frameworks (Akka, Erlang, Orleans) use a **scheduler + small thread pool**:
+
+```
+┌──── millions of actors, each with a mailbox ────┐
+│  📬 📬 📬 📬 📬 📬 ...                            │
+└──────────────────────────────────────────────────┘
+                       ↑
+              [ Scheduler / Dispatcher ]
+                       ↑
+┌──── small thread pool (e.g. 16 threads) ────┐
+│   T1  T2  T3  T4  ...  T16                    │
+└──────────────────────────────────────────────┘
+```
+
+Worker thread loop:
+
+```cpp
+while (running) {
+    Actor* a = scheduler.pickActorWithMessages();
+    if (a->tryLock()) {                  // only one worker can claim an actor
+        Message m = a->mailbox.poll();
+        a->onReceive(m);
+        a->unlock();
+    }
+}
+```
+
+**The invariant:** *"At most one thread is inside any given actor's `onReceive` at any moment."*
+
+So: 16 threads, millions of actors, but per actor it's still single-threaded. Best of both worlds.
+
+---
+
+## 9. Real-World Pattern #1 — Async Background Work
+
+**Disguise:** "This operation takes too long to do inline."
+
+**Example:** User signs up. You need to save them (fast, 10ms) AND send a welcome email (slow, 500ms). Doing both inline = user stares at a spinner.
+
+**Solution:**
+
+```cpp
+struct EmailTask {
+    std::string recipient;
+    std::string templateName;
+};
+
+class SignupService {
+    BlockingQueue<EmailTask> emailQueue_;   // bounded, e.g. 10000
+    UserRepository& repo_;
+
+public:
+    void signup(const std::string& email, const std::string& name) {
+        repo_.save(email, name);                          // fast: save user
+        emailQueue_.put({email, "welcome"});              // fast: enqueue
+        // returns immediately — user sees instant response
+    }
+
+    void emailWorker() {
+        while (true) {
+            EmailTask task = emailQueue_.take();          // blocks if empty
+            sendEmail(task);                              // slow, but no one's waiting
+        }
+    }
+};
+```
+
+### Other examples in this disguise
+
+| Problem | Fast (inline) | Slow (queued) |
+|---|---|---|
+| Image upload | Save raw bytes | Resize, compress, upload to S3 |
+| Checkout | Save order | Charge card, email receipt, ship label |
+| Report generation | Mark "pending" | Run query, generate CSV |
+| User signup | Save user | Welcome email, analytics events |
+
+### Interview soundbite
+
+> *"I'll decouple the request path from background processing using a bounded blocking queue. The handler enqueues a task and returns immediately while workers process asynchronously."*
+
+---
+
+## 10. Real-World Pattern #2 — Bursty Traffic & Load Shedding
+
+**Disguise:** "Traffic comes in waves — most of the time it's fine, then suddenly it's 100x."
+
+**Examples:**
+- News site → quiet, then breaking news → 100x spike
+- Ticket seller → silent, then concert tickets drop → meltdown
+- Webhook receiver → 100/min, then upstream flash sale → 10,000/min
+
+### The dumb solution: scale workers for the peak
+
+Need 1000 workers for the spike? Run 1000 workers always. Pay for 1000 workers all year. They sit idle 99% of the time.
+
+### The smart solution: queue absorbs the burst
+
+- Size workers for **normal** load (e.g., 100)
+- Size queue to **absorb the spike** (e.g., 100,000)
+- During spike: queue fills, workers churn at sustainable rate
+- After spike: queue drains, system returns to normal
+
+```cpp
+struct PurchaseRequest {
+    std::string userId;
+    std::string eventId;
+    int quantity;
+};
+
+class TicketService {
+    std::queue<PurchaseRequest> queue_;
+    std::mutex mutex_;
+    std::condition_variable not_empty_, not_full_;
+    static constexpr size_t MAX_SIZE = 100000;   // absorbs ~10s at 10k/sec
+
+public:
+    // Producer — fails fast under overload
+    void purchase(PurchaseRequest req) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        bool ok = not_full_.wait_for(lock, std::chrono::milliseconds(100),
+            [this] { return queue_.size() < MAX_SIZE; });
+        if (!ok) {
+            throw std::runtime_error("503: Too many requests, try again");
+        }
+        queue_.push(std::move(req));
+        not_empty_.notify_one();
+    }
+
+    // Worker — runs at steady rate
+    void worker() {
+        while (true) {
+            PurchaseRequest req;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                not_empty_.wait(lock, [this] { return !queue_.empty(); });
+                req = std::move(queue_.front());
+                queue_.pop();
+                not_full_.notify_one();
+            }
+            processPurchase(req);
+        }
+    }
+};
+```
+
+### Why this works
+
+The spike is **time-shifted**, not eliminated:
+
+- 10s spike at 10,000 req/s = 100,000 requests
+- Workers process 100 req/s
+- Drain time after spike: ~17 minutes
+
+The work still gets done, just spread over a survivable window. Some users wait extra seconds, but **nothing crashes**.
+
+### Interview soundbite
+
+> *"I'll put a bounded queue between the API and workers. Workers run at sustainable capacity, the queue absorbs spikes, and producers timeout-and-reject if it overflows. This protects downstream systems and lets me size for normal load instead of peak."*
+
+---
+
+## 11. Common Mistakes to Avoid
+
+| Mistake | Consequence | Fix |
+|---|---|---|
+| **Unbounded queue** | OOM under load | Always pass a capacity |
+| **`wait()` without predicate** | Spurious wakeups break logic | `wait(lock, [&]{ return cond; })` |
+| **Modifying state without holding mutex** | Race conditions | Lock before every read/write of shared state |
+| **Running task inside the lock** | Serializes all work | Release lock before invoking the task |
+| **Swallowing shutdown signal** | Threads can't be stopped | Always check shutdown flag in wait predicate |
+| **Sharing data between actors directly** | Defeats the entire model | Communicate only via `send()` |
+| **Using `notify_one()` for shutdown** | Only wakes one waiter | Use `notify_all()` to broadcast |
+| **Infinite worker loop with no exit** | Hangs on shutdown | Check `running_` flag in predicate |
+| **Sizing queue too large** | Memory bloat, stale work | Size ~ throughput × burst seconds |
+| **Sizing queue too small** | Producers blocked frequently | Increase based on real burst patterns |
+
+---
+
+## 12. Interview Cheat Sheet
+
+### The mental model
+
+| Concept | One-liner |
+|---|---|
+| Blocking queue | Thread-safe queue that **sleeps** instead of failing |
+| Backpressure | Producers automatically slow down when consumers can't keep up |
+| Load shedding | Reject some requests fast so the rest can be served |
+| Graceful shutdown | Wake blocked threads cleanly so no work is lost |
+| Actor | Entity with private state + mailbox; processes messages one at a time |
+| Scheduler trick | Many actors, few threads, scheduler enforces "one thread per actor at a time" |
+
+### When to reach for what
+
+- *"Background work needed"* → **bounded blocking queue**
+- *"Bursty traffic"* → **bounded blocking queue + `wait_for` timeout**
+- *"Many independent stateful entities"* → **actor model**
+- *"Just need work handoff between threads"* → **blocking queue** (don't over-engineer)
+
+### One-line answers to drop in interviews
+
+| Question | Answer |
+|---|---|
+| Background work? | *"Bounded blocking queue. Handler enqueues, returns immediately. Workers process async."* |
+| Bursty traffic? | *"Queue absorbs the burst. Workers run at steady rate. Producers timeout-and-reject on overflow."* |
+| Shutdown? | *"Atomic flag + `notify_all`, predicate checks the flag. Or poison pill if I can't signal directly."* |
+| Stateful entities? | *"Actor model. Each entity owns its state, processes messages sequentially, no locks in business logic."* |
+| Why not unbounded? | *"Unbounded queue removes backpressure. Memory grows until OOM."* |
+
+### The universal rules
+
+1. **Bound everything.** No unbounded queues. Ever.
+2. **Backpressure always.** Slow producers > crashed consumers.
+3. **Shutdown is a feature**, not an afterthought.
+4. **Run tasks outside locks.** Locks guard data, not work.
+5. **Predicates on every `wait()`.** Spurious wakeups are real.
+6. **Pick the right tool.** Queue for tasks, actor for entities.
+
+---
+
+> The best concurrent code is code that **doesn't need to be concurrent inside.**
+> Make each unit (worker or actor) sequential, and let the world be parallel between them.
