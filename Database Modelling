@@ -1,0 +1,359 @@
+# Database Modelling — Quick Revision (Q&A Format)
+
+---
+
+## Part 1: Database Types & Trade-offs
+
+### Q: What's the default database choice for system design?
+
+**PostgreSQL (relational/SQL).** Unless requirements clearly signal otherwise. Most problems map naturally to tables with relationships. Even the largest companies (Facebook, Airbnb, LinkedIn) run on relational foundations.
+
+### Q: When should I use a Relational DB (Postgres)?
+
+When you have:
+- Clear entities with relationships (users, posts, orders, payments)
+- Need for complex queries (JOINs, aggregations, filtering)
+- Strong consistency requirements (ACID — no double-charges, no overselling)
+- Need for flexible querying (ad-hoc queries, reporting)
+
+### Q: What are ACID guarantees and why do they matter?
+
+- **Atomicity:** transaction either fully happens or fully doesn't (no half-states)
+- **Consistency:** DB moves from one valid state to another (constraints always satisfied)
+- **Isolation:** concurrent transactions don't see each other's half-finished work
+- **Durability:** once committed, data survives crashes
+
+**Matters for:** payments, inventory, banking — anywhere being "wrong" costs real money or trust.
+
+### Q: When should I use a Document DB (MongoDB)?
+
+- Records have vastly different structures (product catalog: laptops vs t-shirts vs books)
+- Schema changes frequently and upfront fields aren't known
+- Data is self-contained (fetched as one unit, rarely joined with other entities)
+- Moderate write volume (< 50K writes/sec)
+
+**NOT for:** transactions across documents, extreme write volume, heavy relationships between entities.
+
+### Q: What's the fundamental difference between SQL and Document DBs?
+
+SQL: data split across normalized tables, linked by foreign keys. Powerful queries via JOINs.
+Document: related data nested inside one JSON blob. Fast single-entity reads, but updating nested data or querying across documents is painful.
+
+```
+SQL: users table + posts table + likes table → JOIN to combine
+Mongo: one user document with posts[] and likes[] embedded inside
+```
+
+### Q: When should I use a Key-Value Store (Redis)?
+
+**Almost always as a sidekick to SQL, not a replacement.**
+
+- Caching hot data (user profiles, product info)
+- Session storage (checked every request, must be sub-ms)
+- Rate limiting (atomic counters with TTL)
+- Feature flags (checked every page load)
+- Job queues (Sidekiq uses Redis)
+- Real-time counters (likes, views — batch-write to SQL later)
+
+**Pattern:** SQL = source of truth (durable, queryable). Redis = speed layer (fast, ephemeral).
+
+### Q: Why is Redis so fast?
+
+Everything lives in RAM. No disk. No query planning. No SQL parsing. It's a hashmap lookup — O(1). A GET takes ~0.1ms vs ~5ms for a Postgres query.
+
+**Trade-off:** limited to key-based lookups. Can't do "find all users where age > 25."
+
+### Q: When should I use a Wide-Column DB (Cassandra)?
+
+The 3-question test — all must be "yes":
+1. Is write volume extreme? (millions/sec, growing forever)
+2. Do you always know the partition key when reading?
+3. Can you live without JOINs and ad-hoc queries?
+
+**Perfect for:** time-series, metrics/monitoring, IoT sensors, event logs, chat history.
+**Terrible for:** e-commerce orders (need transactions), ad-hoc queries, small datasets.
+
+### Q: Why is Cassandra so fast at writes?
+
+LSM-tree architecture — eliminates everything that makes SQL writes slow:
+
+| SQL Write | Cassandra Write |
+|-----------|----------------|
+| Update table on disk (random I/O) | Append to commit log (sequential) |
+| Update 3 indexes (random I/O each) | Write to in-memory memtable |
+| Check constraints | No constraints |
+| Acquire locks | No locks |
+| ~5 random disk operations | 1 sequential write + 1 RAM write |
+
+Client gets ACK after commit log + memtable. Disk flush happens in background. All expensive work is deferred.
+
+### Q: Why can't MongoDB replace Cassandra for time-series?
+
+At extreme write volume (50M writes/sec):
+- MongoDB maintains indexes on every write (expensive at scale)
+- MongoDB uses document-level locks (contention)
+- MongoDB scatters data on disk (random I/O for reads)
+- MongoDB has primary-per-shard (write bottleneck)
+
+Cassandra: no indexes on write path, no locks, data physically sorted by partition+time (sequential reads), any node accepts writes (no bottleneck).
+
+### Q: When should I use a Graph DB (Neo4j)?
+
+**Almost never in interviews.** Even Facebook models their social graph with MySQL. A simple `follows(follower_id, followed_id)` join table handles "who does user X follow?" perfectly.
+
+Only real uses: fraud detection with 10+ hop traversals, knowledge graphs. Not interview material.
+
+### Q: Summary — which database for which signal?
+
+| Requirement You Hear | Choose | One-line Reason |
+|---------------------|--------|----------------|
+| Payments, inventory, banking | Postgres | ACID — partial states are unacceptable |
+| Users, posts, orders, e-commerce | Postgres | Clear relationships, flexible queries |
+| Schemas change frequently, varied record shapes | MongoDB | No migrations needed per change |
+| Billions of events/day, time-series, IoT | Cassandra | Append-only firehose, scan by time |
+| Fast lookups by ID, caching | Redis + Postgres | Source of truth + speed layer |
+| Social graph, followers | Postgres | Join table works. Facebook agrees. |
+
+---
+
+## Part 2: The 4 Pillars of SQL Scaling
+
+### Q: What are the 4 techniques for scaling SQL, and in what order do you adopt them?
+
+1. **Connection Pooling** — day one, table stakes
+2. **Caching** — first lever when reads spike
+3. **Read Replicas** — when cache misses still overwhelm the primary
+4. **Sharding** — last resort, when nothing else solves write throughput
+
+Each step is more complex to operate. Earn your way to the next one.
+
+---
+
+### Pillar 1: Connection Pooling
+
+### Q: What is connection pooling?
+
+Keeping a set of open database connections ready for reuse instead of opening/closing one per request. Like keeping rental cars ready vs building a car for each trip.
+
+### Q: Why does opening a connection matter?
+
+Opening a new connection = TCP handshake + authentication + SSL + memory allocation = ~50-100ms overhead. With pooling, that's 0ms — just borrow a pre-opened one.
+
+### Q: Where does pooling live?
+
+Three levels:
+- **Application (Rails):** `database.yml` → `pool: 10` (ActiveRecord manages internally)
+- **External (PgBouncer):** sits between all app servers and DB, multiplexes 300 app connections → 20 real DB connections
+- **Cloud-managed (RDS Proxy):** zero-config pooling from AWS/GCP
+
+### Q: When is a DB connection actually used?
+
+Only during SQL execution: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `BEGIN/COMMIT`. NOT during computation, external API calls, file processing, or sleep.
+
+### Q: What's the formula for pool size?
+
+```
+pool size >= max concurrent threads per process that touch the DB
+```
+- Puma with 5 threads → pool = 5
+- Sidekiq with 25 concurrency → pool = 25
+- Total connections to Postgres = sum across all processes (must be < max_connections)
+
+### Q: What are the three pitfalls of connection pooling?
+
+**1. Holding too long:** Background job does external API call while holding connection for 30 seconds.
+- Fix: `ActiveRecord::Base.connection_pool.release_connection` before slow non-DB work.
+
+**2. Leaking in threads:** Manual thread checks out connection, thread dies, connection never returned.
+- Fix: Always wrap in `ActiveRecord::Base.connection_pool.with_connection { }`
+
+**3. Wrong pool size:** Too small = requests wait (`ConnectionTimeoutError`). Too large = Postgres overwhelmed.
+- Fix: Match pool to concurrency. Use PgBouncer if math doesn't add up.
+
+### Q: Why are background jobs the biggest risk for connection pooling?
+
+Web requests are naturally short (50-500ms) — connection returns quickly. Background jobs have no timeout pressure, can run for minutes, and often do slow non-DB work (API calls, email, file generation) while holding a connection. 25 Sidekiq workers × 30-second holds = pool completely drained.
+
+---
+
+### Pillar 2: Caching (Redis)
+
+### Q: How does caching work with SQL?
+
+```
+Request → Check Redis (0.1ms) → Hit? Return. Miss? → Query Postgres (5ms) → Store in Redis → Return.
+```
+Next 100 requests for same data → served from Redis. Postgres untouched.
+
+### Q: What are the three cache invalidation strategies?
+
+| Strategy | How | Trade-off |
+|----------|-----|-----------|
+| **TTL (Time-To-Live)** | Cache expires after N seconds | Simple, slightly stale |
+| **Write-through** | Every DB write also updates cache | Consistent, more complex |
+| **Cache-aside** | App manages read/write to cache manually | Most common, most error-prone |
+
+### Q: What's the consistency trade-off with caching?
+
+SQL says: user has 1000 followers.
+Redis (cached 2 min ago) says: 998 followers.
+
+You accept slight staleness for massive speed. For feeds, profiles, counters — nobody notices. For money, inventory, permissions — never trust cache, always go to DB.
+
+### Q: What data is ideal for caching?
+
+Read-heavy data that doesn't change every request: user profiles, product catalogs, feed rankings, config/settings, session data. NOT: real-time account balances, inventory counts for purchasing.
+
+---
+
+### Pillar 3: Read Replicas
+
+### Q: What are read replicas?
+
+Clones of the primary database that handle read traffic. Writes go to ONE primary, reads distributed across multiple replicas.
+
+```
+[App] --writes--> [Primary DB]
+                      |  (replication stream)
+        +-------------+-------------+
+        v             v             v
+   [Replica 1]  [Replica 2]  [Replica 3]  ← reads distributed here
+```
+
+### Q: Why do they work?
+
+Most apps are 90%+ reads. Feeds, profiles, catalogs — all SELECTs. Writes (INSERT/UPDATE) are rare by comparison. Replicas scale the bottleneck (reads) horizontally.
+
+### Q: What's the catch?
+
+**Replication lag.** User posts something, immediately refreshes — replica might not have it yet (data still traveling from primary → replica).
+
+Fix: **read-your-own-writes routing** — for the user who just wrote, route their reads to the primary for a few seconds. Everyone else reads from replicas.
+
+### Q: When to reach for read replicas?
+
+Your DB CPU is pegged but most queries are SELECTs, and cache hit rates aren't enough to solve it.
+
+---
+
+### Pillar 4: Sharding
+
+### Q: What is sharding?
+
+Splitting data across multiple independent database instances based on a key. Each shard holds a subset of total data.
+
+```
+user_id 1-1M      → Shard A (Machine 1)
+user_id 1M-2M     → Shard B (Machine 2)
+user_id 2M-3M     → Shard C (Machine 3)
+```
+
+### Q: Why do it?
+
+Each shard is smaller (faster queries), handles fewer connections, and most importantly: **scales WRITES** (which read replicas can't).
+
+### Q: What's the golden rule of shard key selection?
+
+**Shard by your primary access pattern.** If 90% of queries are "get data for user X," shard by user_id. All of user X's data lives on one shard — one machine to query.
+
+### Q: Why is time-based sharding usually bad?
+
+All current traffic hits the latest shard. It's May — 100% of writes go to the May shard. Other shards sit idle. That one shard is on fire (hot shard). The exact problem sharding was supposed to solve.
+
+Works only for archival/analytics where recent data is read-heavy but writes are spread out.
+
+### Q: What makes sharding painful?
+
+- **Cross-shard queries:** "show posts from all 500 people I follow" — those users are spread across all shards. Must query each, merge, sort. Expensive.
+- **JOINs across shards:** basically impossible.
+- **Rebalancing:** when one shard gets too big/hot, moving data is complex.
+- **Permanent decision:** changing your shard key later = migrating all data.
+
+### Q: When to reach for sharding?
+
+Only when: you've exhausted vertical scaling, read replicas, and caching. Your WRITE volume is the bottleneck. Data naturally partitions by some key. This is a last resort.
+
+---
+
+## Part 3: Schema Design (Interview Checklist)
+
+### Q: What drives schema design decisions?
+
+Three factors:
+1. **Data volume** — can it fit on one machine?
+2. **Access patterns** — how will data be read? (most important)
+3. **Consistency requirements** — can some data be eventually consistent?
+
+### Q: What's the interview formula for schema design?
+
+```
+1. Name entities        → "Users, posts, comments, likes"
+2. Pick primary keys    → Auto-increment IDs (never business data like email)
+3. Define relationships → posts.user_id FK → users.id (one-to-many)
+4. Add indexes          → Match to API endpoints
+5. Normalize or not     → Normalized default, denormalize only with reason
+6. Shard if needed      → Key matches primary access pattern
+```
+
+### Q: How do you pick indexes?
+
+Match them to your API endpoints:
+
+| Endpoint | Query | Index |
+|----------|-------|-------|
+| GET /users/:id/posts | WHERE user_id = ? | posts(user_id) |
+| GET /feed | WHERE user_id IN (...) ORDER BY created_at DESC | posts(user_id, created_at) |
+| GET /posts/:id/comments | WHERE post_id = ? | comments(post_id) |
+
+### Q: What's a composite index?
+
+Index on multiple columns: `(user_id, created_at)`. Serves both the filter (which user) AND the sort (newest first) in one index lookup.
+
+### Q: What's the cost of indexes?
+
+Speed up reads, slow down writes. Every INSERT must also update every index (B-tree rebalancing). Don't index everything — only columns you actually query by.
+
+### Q: Should I normalize or denormalize?
+
+**Default: normalize** (each fact stored once). Denormalize only when:
+- Hot read path where JOIN is too slow at scale
+- Event logs / audit trails (snapshot at point in time)
+- Analytics tables (pre-aggregated daily summaries)
+
+**Better alternative to denormalization:** normalized Postgres + denormalized Redis cache. Clean source of truth + fast reads.
+
+### Q: What's the trade-off of foreign keys?
+
+**With FK:** DB prevents orphaned records (post referencing deleted user). Guarantees integrity.
+**Cost:** DB validates on every INSERT/UPDATE. At extreme scale, some companies drop them and enforce integrity in application code.
+
+**Interview move:** "I'd use foreign keys for correctness. At extreme scale we might drop them and enforce at the app level — like Facebook does."
+
+---
+
+## Part 4: Quick-Fire Recall
+
+### Q: Postgres can't scale — true or false?
+
+**Mostly false.** Modern Postgres scales with connection pooling + caching + read replicas + sharding. Facebook and Airbnb run on relational foundations. Scaling is about architecture, not just database choice.
+
+### Q: What's the biggest mistake candidates make with database selection in interviews?
+
+Reaching for exotic databases (graph DBs, Cassandra) when Postgres handles the problem fine. It signals over-engineering, not sophistication.
+
+### Q: When do you use Redis AND Postgres together?
+
+Almost always. Postgres = durable source of truth. Redis = ephemeral speed layer for hot reads. This is the most common production architecture.
+
+### Q: What's eventual consistency in simple terms?
+
+"The data will be correct... eventually. Just not right this second." Acceptable for: feeds, like counts, recommendations. Unacceptable for: money, inventory, permissions.
+
+### Q: Name a scenario where each scaling technique solves the problem:
+
+| Problem | Solution |
+|---------|----------|
+| "Too many connections" error on Postgres | Connection pooling (PgBouncer) |
+| Same user profile queried 10,000 times/min | Caching (Redis) |
+| DB CPU at 95%, mostly SELECT queries | Read replicas |
+| Single DB can't handle write volume | Sharding |
