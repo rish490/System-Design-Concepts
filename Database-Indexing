@@ -1,0 +1,654 @@
+# Database Indexing — Complete Study Guide
+
+> A comprehensive Q&A guide covering database indexing fundamentals, B-trees, LSM trees, hash indexes, geospatial indexes, composite/covering indexes, and production architecture patterns. Designed for L1/L2 system design interviews (2-4 YOE).
+
+---
+
+## Table of Contents
+
+1. [Indexing Fundamentals](#1-indexing-fundamentals)
+2. [B-Tree Indexes](#2-b-tree-indexes)
+3. [LSM Trees](#3-lsm-trees)
+4. [Disk I/O Fundamentals](#4-disk-io-fundamentals)
+5. [Hash Indexes](#5-hash-indexes)
+6. [Geospatial Indexes — Geohash](#6-geospatial-indexes--geohash)
+7. [Redis & Production Architecture](#7-redis--production-architecture)
+8. [Composite & Covering Indexes](#8-composite--covering-indexes)
+9. [Cost-Benefit & Decision-Making](#9-cost-benefit--decision-making)
+10. [Interview-Ready One-Liners](#10-interview-ready-one-liners)
+
+---
+
+## 1. Indexing Fundamentals
+
+### Q: What is a database index and why do we need it?
+
+An index is a separate, sorted data structure that points to where data lives in the main table. Without an index, the database does a **full table scan** — checking every page of data on disk until it finds the matching row.
+
+For a table with millions of rows, a full scan is brutal because each disk page load takes microseconds, and there are thousands of pages.
+
+An index reduces this to **2-3 disk reads** regardless of table size.
+
+### Q: How is table data physically stored?
+
+Table data lives in a **heap file** — a collection of rows in no particular order (insertion order). Think of it like a notebook where you write entries as they come.
+
+Reading the data requires loading pages from disk into RAM (each page is typically 8 KB).
+
+### Q: What are the trade-offs of using indexes?
+
+| Benefit | Cost |
+|---------|------|
+| Faster reads (10x-10,000x) | Slower writes (each insert updates all indexes) |
+| Faster sorting (pre-sorted data) | Additional disk space (sometimes ~as much as data) |
+| Efficient joins | Maintenance overhead |
+| Uniqueness enforcement | More complex query planning |
+
+### Q: When should you NOT add indexes?
+
+- **Write-heavy columns** where maintenance cost > read benefit
+- **Tiny tables** (few hundred rows) — full scan is faster than tree traversal
+- **Columns that are rarely queried**
+- **Volatile columns** like counters, view counts, last_activity timestamps
+
+---
+
+## 2. B-Tree Indexes
+
+### Q: What makes a B-tree different from a binary tree?
+
+A binary tree has 2 children per node. A B-tree has **hundreds of children per node** — each node is packed with many keys to fill an entire 8 KB disk page.
+
+This means:
+- Tree stays incredibly shallow (3-4 levels for **billions** of rows)
+- Each disk read extracts maximum information (97% of page used vs 0.6% for binary tree)
+- Lookup takes 2-3 disk reads regardless of table size
+
+### Q: Why is the B-tree shape "designed around disk hardware"?
+
+A disk reads in **fixed-size pages (8 KB)**. You can't request just 50 bytes — you always get the full page.
+
+The B-tree's design philosophy:
+> "If I'm forced to read 8 KB anyway, I'll make every byte useful by packing hundreds of keys into each node."
+
+This minimizes "I/O bandwidth waste" — getting maximum search progress per disk read.
+
+### Q: How does a B-tree lookup work?
+
+For `SELECT * FROM users WHERE id = 742,831`:
+
+```
+Step 1: Read ROOT node from disk
+        → Contains keys like [100, 200, 400, 600, 800, ...]
+        → 742,831 is between 600 and 800 → follow that pointer
+
+Step 2: Read INTERNAL node from disk
+        → Contains [610, 650, 700, 750, ...]
+        → Narrow further → follow appropriate pointer
+
+Step 3: Read LEAF node from disk
+        → Contains [741,000 ... 742,831 ... 743,000]
+        → FOUND! Follow pointer to actual row in heap file
+```
+
+**Total: 3 disk reads.**
+
+### Q: What is "scaling math" for B-trees?
+
+| Records in table | B-tree depth | Disk reads to find |
+|------------------|--------------|---------------------|
+| 1,000 | 2 levels | 2 |
+| 1,000,000 | 3 levels | 3 |
+| 1,000,000,000 | 4 levels | 4 |
+
+Adding 1000x more data only adds **one more disk read**. That's the magic.
+
+### Q: Why are B-trees great at range queries?
+
+Because keys are **sorted**, range queries like `WHERE created_at BETWEEN x AND y` become a **sequential walk** through leaf nodes:
+
+```
+[May 15-17] → [May 18-20] → [May 21-23] → [May 24-26]
+              ↑ start here                  ↑ stop here
+```
+
+This is sequential I/O — very fast.
+
+### Q: What databases use B-trees by default?
+
+- PostgreSQL (almost everything)
+- MySQL InnoDB (primary keys + secondary indexes)
+- MongoDB (uses B+ trees — a variant)
+- Oracle
+- SQL Server
+
+If you don't know what index to use, B-tree is the right answer 95% of the time.
+
+---
+
+## 3. LSM Trees
+
+### Q: What problem do LSM trees solve?
+
+B-trees struggle with **high write volume** because each write requires random disk I/O. At 100,000+ writes/sec, you exceed what disk hardware can sustain (~50,000-100,000 random IOPS).
+
+LSM trees flip this: they buffer writes in memory and flush sorted batches to disk **sequentially**, which is 15-100x faster than random I/O.
+
+### Q: How does an LSM tree handle writes? (High level)
+
+```
+1. Append write to WAL (sequential disk file) — durability
+2. Insert into memtable (sorted structure in RAM) — speed
+3. Acknowledge write to client (microseconds total)
+
+Later, when memtable fills:
+4. Freeze memtable, swap in fresh empty one (no blocking)
+5. Background thread flushes frozen memtable as one big sorted file (SSTable)
+6. Truncate WAL entries (data is now safely on disk)
+```
+
+Writes never do random I/O. Ever.
+
+### Q: How do LSM trees handle reads?
+
+Data is spread across multiple SSTable files, so reads must check:
+1. Active memtable
+2. Immutable memtables
+3. All SSTables on disk (newest first)
+
+**Worst case:** check dozens of files. To make this manageable, use:
+- **Bloom filters** — quickly skip files that definitely don't contain the key (zero disk reads)
+- **Sparse indexes** — jump to the right block within a file
+
+### Q: What is a Bloom filter and why is it critical for LSM trees?
+
+A compact bit array that answers: "Could key X possibly be in this file?"
+
+- **"NO"** → 100% certain not there → skip the file entirely
+- **"MAYBE"** → could be there → must check
+
+Without bloom filters, LSM trees would be unusable for reads. With them, most queries skip 95%+ of SSTables.
+
+### Q: What does "compaction" do?
+
+A background process that merges multiple SSTables into one, keeping only the newest version of each key and dropping deleted entries (tombstones). Keeps file count manageable and reclaims disk space.
+
+### Q: When should you choose LSM trees over B-trees?
+
+| Workload | Pick | Why |
+|----------|------|-----|
+| User profiles, product catalog | B-tree | Read-heavy |
+| Metrics ingestion (Datadog) | LSM | 100k+ writes/sec |
+| Logs, events, IoT data | LSM | Write-dominated |
+| E-commerce orders | B-tree | Balanced, need fast lookups |
+
+Rule of thumb: **LSM if writes >> reads or reads can tolerate higher latency.**
+
+### Q: What databases use LSM trees?
+
+- Cassandra (Netflix's viewing events)
+- RocksDB (Facebook's storage engine)
+- LevelDB (Google)
+- DynamoDB (LSM-style architecture)
+
+---
+
+## 4. Disk I/O Fundamentals
+
+### Q: What's the difference between sequential and random I/O?
+
+- **Sequential**: accessing consecutive disk addresses (1000, 1001, 1002...)
+- **Random**: accessing non-adjacent addresses (1000, 891203, 47392...)
+
+The disk doesn't care which addresses — it cares whether the next one is **next to** the previous one.
+
+### Q: Why is random I/O slow on SSDs (not just HDDs)?
+
+Even SSDs are organized into blocks. Random writes can trigger:
+- Read-modify-write of entire blocks
+- Garbage collection overhead
+- Write amplification (writing more than requested)
+
+Speed difference:
+- Sequential write: ~3,000 MB/s
+- Random write: ~50-200 MB/s
+
+That's a 15-60x gap on SSDs, and 100-200x on HDDs.
+
+### Q: Why are B-tree writes considered "random"?
+
+B-tree nodes get scattered across the disk over time as the tree grows, splits, and reorganizes. Even though the **logical path** is a clean tree traversal (root → child → leaf), each node lives at an unrelated physical address.
+
+The disk sees: "give me page 1.4M, now page 47K, now page 14" — three jumps to unrelated places.
+
+### Q: Are B-tree writes always slow then?
+
+No — they're only slow at **high volume**. For a few thousand writes/sec, B-trees work fine. The problem emerges at 100,000+ writes/sec when random IOPS exceed the disk's capacity.
+
+For one write, the difference is microseconds either way.
+
+---
+
+## 5. Hash Indexes
+
+### Q: What is a hash index?
+
+A hashmap that maps indexed values directly to row locations:
+- Hash the value to get a bucket number
+- Go to that bucket
+- Follow pointer to the row
+
+O(1) lookups — the absolute fastest possible.
+
+### Q: Why don't most databases default to hash indexes?
+
+Hash indexes are **useless for**:
+- Range queries (`WHERE age > 25`)
+- Sorting (`ORDER BY name`)
+- Prefix matching (`WHERE email LIKE 'ali%'`)
+
+Because hashing scatters similar values across random buckets, nearby values aren't physically near each other.
+
+B-trees handle exact matches almost as fast AND handle ranges/sorting — so they win by versatility.
+
+### Q: When are hash indexes actually useful?
+
+Mainly in **in-memory databases** where disk I/O isn't a concern:
+- Redis (entire core is a hash table)
+- Memcached
+- MySQL MEMORY storage engine
+
+### Q: What's the interview takeaway on hash indexes?
+
+> "B-trees solve most of what hash indexes can do, plus more. Hash indexes shine in in-memory key-value stores like Redis."
+
+Don't overemphasize them — it signals you're out of touch with real-world database practices.
+
+---
+
+## 6. Geospatial Indexes — Geohash
+
+### Q: Why don't regular B-tree indexes work for location data?
+
+Location is inherently 2D — proximity means close on BOTH latitude AND longitude. B-trees are 1D. Two failure modes:
+
+1. **Long strip problem**: Index on latitude alone returns all restaurants in a band around the entire Earth at that latitude
+2. **Square peg, round hole**: Intersecting latitude + longitude indexes gives a rectangular search area much larger than your actual circular search radius
+
+### Q: What is geohash in one sentence?
+
+> Geohash converts a 2D (lat, lng) coordinate into a 1D string where nearby locations share common prefixes.
+
+This lets you use a regular B-tree for spatial queries via prefix matching.
+
+### Q: How is a geohash created?
+
+1. Convert latitude (-90 to +90) to bits via binary search game
+2. Convert longitude (-180 to +180) to bits the same way
+3. **Interleave** the bits (longitude bit, latitude bit, longitude bit, ...)
+4. Group into 5-bit chunks
+5. Encode each chunk via base32 alphabet (`0123456789bcdefghjkmnpqrstuvwxyz`)
+
+Result: a string like `"tdr1uy"` representing a location.
+
+### Q: How does geohash precision relate to distance?
+
+| Length | Cell size | Use case |
+|--------|-----------|----------|
+| 4 chars | ~39 km | Metro area |
+| 5 chars | ~5 km | Neighborhood |
+| 6 chars | ~1.2 km | City block |
+| 7 chars | ~150 m | Building |
+| 8 chars | ~38 m | Room |
+
+Pick precision where cell size ≈ user's search radius.
+
+### Q: How does a proximity query work with geohash?
+
+```
+1. User says: "restaurants within 2 km of me"
+2. Compute user's geohash at appropriate precision: "tdr1uy"
+3. Compute the 8 neighboring geohash cells (handles edge-of-grid cases)
+4. Run 9 prefix scans on the B-tree:
+   WHERE geohash LIKE 'tdr1uy%' OR geohash LIKE 'tdr1uz%' OR ...
+5. Filter candidates by true haversine distance for accuracy
+6. Sort and return
+```
+
+### Q: Why do we need to check the 8 neighboring cells?
+
+Two locations on opposite sides of a cell boundary can be physically close but have completely different geohash prefixes. Without checking neighbors, you'd miss restaurants right across the street from you.
+
+The 9-cell search (your cell + 8 neighbors) guarantees coverage across all edges.
+
+### Q: How are the 8 neighbors actually computed?
+
+By manipulating the **underlying lat/lng bits** of the geohash, not by string manipulation. Libraries provide a `neighbors()` function that does this for you.
+
+Why? Because geohash uses interleaved bit encoding — physical adjacency doesn't map to alphabetical adjacency in the string.
+
+### Q: Where is geohash used in real apps?
+
+- **Tinder/Bumble** — "people near you"
+- **Uber/Lyft** — "drivers near you"
+- **Swiggy/DoorDash** — restaurants/riders nearby
+- **Airbnb/Zillow** — map-bounded property searches
+- **Instagram/Snapchat** — geotagged content
+- **Foursquare** — check-ins
+- **Geofencing apps** — entry/exit notifications
+
+---
+
+## 7. Redis & Production Architecture
+
+### Q: How does Redis fit into the geospatial architecture?
+
+Redis provides **native geospatial commands** (using geohash internally) with sub-millisecond latency:
+
+```redis
+GEOADD drivers <lng> <lat> "driver_42"
+GEOSEARCH drivers FROMLONLAT <lng> <lat> BYRADIUS 2 km
+```
+
+Redis hides all geohash complexity — you just store lat/lng and query by radius.
+
+### Q: How does Redis store geospatial data internally?
+
+As a **sorted set**:
+- Member = location ID (e.g., `"driver_42"`)
+- Score = geohash converted to a 52-bit integer
+
+Nearby drivers have similar scores → they cluster in the sorted set → range scans are O(log n + matches).
+
+### Q: What hits Redis vs PostgreSQL in a typical app?
+
+**Redis (hot path)**:
+- Driver locations (updated every few seconds)
+- Active session state
+- "Find nearby" queries
+- Live counters that can tolerate loss
+
+**PostgreSQL (cold path)**:
+- User profiles, payment info
+- Trip history (must persist)
+- Reviews, ratings
+- Source-of-truth data with complex queries
+
+### Q: What happens if Redis crashes? Do we lose all driver locations?
+
+**Worst case: ~4 seconds of data loss.**
+
+- Drivers send location every few seconds → Redis self-populates from real-world activity
+- Master + replica setup ensures failover in 1-2 seconds
+- AOF (append-only log) provides crash recovery
+- The drivers' phones are essentially a distributed backup
+
+The data isn't truly "lost" — it's regenerated by ongoing activity.
+
+### Q: Won't we run out of RAM storing millions of locations?
+
+No. Each location is ~60 bytes in Redis.
+
+| Drivers | RAM |
+|---------|-----|
+| 1M | 60 MB |
+| 10M | 600 MB |
+| 100M | 6 GB |
+
+A single 128 GB Redis instance can hold ~2 billion locations. For larger needs, use **Redis Cluster** to shard horizontally.
+
+### Q: Is Redis a database or a cache?
+
+It can be **either**, depending on configuration:
+- With persistence off → cache (data lives elsewhere as source of truth)
+- With AOF + replication → legitimate database
+
+For location data, Redis acts "cache-ish" — drivers continuously re-assert their locations, so Redis self-heals from real-world activity.
+
+---
+
+## 8. Composite & Covering Indexes
+
+### Q: What is a composite index?
+
+An index that combines multiple columns into one B-tree, sorted by the first column, then by the second within each first value, etc.
+
+```sql
+CREATE INDEX idx_user_time ON posts(user_id, created_at);
+```
+
+The B-tree keys look like:
+```
+(1, 2024-01-01)
+(1, 2024-01-15)
+(2, 2024-01-01)
+...
+(123, 2024-01-05)
+(123, 2024-01-12)  ← already sorted by date within user 123
+```
+
+### Q: Why are composite indexes better than separate indexes?
+
+Consider:
+```sql
+SELECT * FROM posts WHERE user_id = 123 AND created_at > '2024-01-01' 
+ORDER BY created_at DESC;
+```
+
+**Two separate indexes**: Database does index intersection (slow) + sort (slow).
+
+**Composite index**: Database jumps to user 123, walks forward through already-sorted entries. One efficient scan.
+
+### Q: Why does column order in a composite index matter?
+
+A composite index on `(A, B, C)` only helps queries that filter on **A first**.
+
+| Query | Index `(user_id, created_at)` helps? |
+|-------|--------------------------------------|
+| `WHERE user_id = 123` | YES |
+| `WHERE user_id = 123 AND created_at > X` | YES |
+| `WHERE created_at > X` | NO — created_at is second column |
+
+It's like a phonebook sorted by last name then first name — useless for "find everyone named John."
+
+### Q: What's the rule of thumb for composite index column order?
+
+> **Equality columns first, range/sort columns last.**
+
+```
+WHERE user_id = 123 AND created_at > '...'
+       ↑ equality                ↑ range
+
+→ Index: (user_id, created_at)  ✓
+```
+
+### Q: What is a covering index?
+
+An index that includes extra columns beyond what's needed for filtering — so the query can be answered entirely from the index without touching the table.
+
+```sql
+CREATE INDEX idx_user_time_likes 
+  ON posts(user_id, created_at) 
+  INCLUDE (likes);
+```
+
+Now `SELECT user_id, created_at, likes FROM posts WHERE user_id = 123` can return results directly from the index. No table lookups.
+
+### Q: What's the trade-off of covering indexes?
+
+- **Pro**: Eliminates table lookups → faster reads (sometimes 5-10x)
+- **Con**: Index is bigger (stores extra columns) → more disk space, slower writes
+
+Use them for **hot read paths** that return few columns. Avoid for write-heavy tables or queries returning many columns.
+
+### Q: Are covering indexes always worth it?
+
+No. Modern query optimizers handle most cases well with regular indexes plus caching. Reach for covering indexes only when:
+- Read query runs constantly (hot path)
+- Returns small set of columns
+- Table has low write volume
+
+When in doubt, prefer simpler indexes.
+
+---
+
+## 9. Cost-Benefit & Decision-Making
+
+### Q: When is an index "expensive"?
+
+Index maintenance happens on:
+- **Every INSERT** → updates all indexes (always)
+- **Every DELETE** → updates all indexes (always)
+- **UPDATE on indexed columns** → updates affected indexes
+- **UPDATE on non-indexed columns** → FREE (no index cost)
+
+### Q: Can a write-heavy table still benefit from indexes?
+
+YES, if the writes touch **different columns** than the ones you've indexed.
+
+Example: a user_sessions table with 50,000 updates/sec on `last_activity`, `cart_data`, `current_page`, but the index is on `user_id` (which never changes after creation). The index is essentially free to maintain despite massive write volume.
+
+> **The right rule is: avoid indexes on write-heavy COLUMNS, not write-heavy tables.**
+
+### Q: How do you decide whether to add an index?
+
+The cost-benefit equation:
+```
+Total read savings  vs  Total write penalties (over table lifetime)
+```
+
+For most user-facing apps, reads dominate writes by 10-1000x. So indexing query columns is almost always a win — even with insert costs.
+
+### Q: What columns are good candidates for indexing?
+
+| Column Type | Index it? |
+|-------------|-----------|
+| Primary keys | Always |
+| Foreign keys (user_id, order_id) | Almost always — rarely change |
+| created_at | Yes if queried — immutable |
+| Email, username | Yes — queried often, rarely changed |
+| Status fields | Carefully — if reads > write cost |
+| view_count, like_count | Almost never — changes constantly |
+| updated_at | Rarely — be specific about why |
+
+### Q: How does schema design connect to indexing decisions?
+
+Tightly. Schema choices affect what indexes make sense:
+
+- **Normalized vs denormalized** → different index strategies
+- **Soft delete vs hard delete** → may need partial indexes
+- **One-to-many cardinality** → high cardinality may warrant covering indexes
+
+Design schema and indexes **together**.
+
+---
+
+## 10. Interview-Ready One-Liners
+
+### "Why use an index?"
+> "Without one, the database does a full table scan. Indexes provide a sorted data structure that lets us find data in O(log n) disk reads instead of O(n)."
+
+### "What index type should I use?"
+> "B-tree by default — handles exact matches, ranges, and sorting well. I'd only deviate for specific needs: geohash for location, inverted index for full-text search, LSM for write-heavy workloads."
+
+### "How does a B-tree scale?"
+> "It packs hundreds of keys per node to maximize disk page utilization. So even with billions of rows, the tree stays only 3-4 levels deep — meaning 2-3 disk reads per lookup."
+
+### "When NOT to add an index?"
+> "Write-heavy columns where the index maintenance cost outweighs the read benefit. Or tiny tables where a full scan is faster than tree traversal."
+
+### "How do you handle proximity search?"
+> "Use a geospatial index. Geohash is the simplest — it converts (lat, lng) to a string where shared prefix means physically nearby. Then we can use a regular B-tree on that string. Redis has this built in via GEOSEARCH."
+
+### "Why does composite index column order matter?"
+> "B-tree sorts by the first column, then by the second within each first value. So the index only helps queries that filter on a prefix of the column list — leftmost columns must appear in the WHERE clause."
+
+### "What's the difference between B-tree and LSM tree?"
+> "B-trees update data in place via random disk I/O — great for reads, fine for moderate writes. LSM trees batch writes in memory and flush sequentially — great for heavy writes (100k+/sec), but reads must check multiple files. Pick based on workload."
+
+### "Why is Redis so common for location queries?"
+> "Redis has native GEOSEARCH using geohash internally, with sub-millisecond latency. It handles the high-frequency write and read patterns of live location data far better than a disk-based DB. PostgreSQL stays as the source of truth for persistent data."
+
+---
+
+## Quick Reference: Index Type Decision Tree
+
+```
+What's the query pattern?
+│
+├─ Exact match, range, or sort needed?
+│  └─ B-Tree (default for 95% of cases)
+│
+├─ Only exact-match lookups, never ranges?
+│  └─ Hash Index (rare; common in Redis/in-memory DBs)
+│
+├─ Latitude/longitude proximity?
+│  └─ Geospatial Index (geohash for most apps)
+│
+├─ Search inside text bodies?
+│  └─ Inverted Index (Elasticsearch, MongoDB text indexes)
+│
+└─ 100k+ writes/sec?
+   └─ LSM Tree storage engine (Cassandra, RocksDB)
+```
+
+---
+
+## Production Architecture Pattern
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Redis (RAM, fast cache)                             │
+│   • Live state (locations, sessions)                 │
+│   • Sub-millisecond reads                            │
+│   • Survives failures via replication + AOF          │
+└──────────────────────────────────────────────────────┘
+                          ↓
+┌──────────────────────────────────────────────────────┐
+│  PostgreSQL (disk, source of truth)                  │
+│   • Profiles, transactions, history                  │
+│   • B-tree indexes everywhere                        │
+│   • Consistent, durable, complex queries             │
+└──────────────────────────────────────────────────────┘
+                          ↓
+┌──────────────────────────────────────────────────────┐
+│  Cassandra/Kafka (write-heavy event stream)          │
+│   • LSM-tree based                                   │
+│   • Audit logs, analytics events                     │
+│   • Sustains massive write throughput                │
+└──────────────────────────────────────────────────────┘
+```
+
+Each storage layer chosen for what its data needs.
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| Index | A cheat sheet pointing to data locations |
+| Heap file | Notebook with entries in insertion order |
+| B-tree | Phone book with hundreds of names per page |
+| LSM tree | Desk pile that periodically gets organized onto shelves |
+| Hash index | Coat-check ticket — instant exact retrieval |
+| Geohash | A coordinate written so similar codes = nearby places |
+| Composite index | Phone book sorted by last name, then first name |
+| Covering index | Phone book with phone numbers included on the same page |
+| Bloom filter | A note on a drawer: "X is definitely not in here" |
+
+---
+
+## What's Next (Recommended Topics)
+
+After indexing, prioritize:
+
+1. **Caching strategies** (cache-aside, write-through, invalidation)
+2. **Database scaling** (replication, sharding, read replicas)
+3. **Message queues** (Kafka, SQS, RabbitMQ)
+4. **Consistency models** (eventual, strong, causal)
+5. **Common system designs** (URL shortener, chat app, news feed)
+
+---
+
+*Created from a deep-dive study session covering Hello Interview's "Database Indexing" article. Designed for L1/L2 system design interviews at 2-4 years of experience.*
