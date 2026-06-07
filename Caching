@@ -1,0 +1,426 @@
+# Caching Strategies — Complete Study Guide
+
+> A comprehensive Q&A guide covering caching fundamentals, caching layers (CDN, Redis, in-process, client-side), cache architectures (cache-aside, write-through, write-behind, read-through), eviction policies, common failure modes, and interview strategy.
+> Designed for L1/L2 system design interviews (2-4 YOE backend engineers).
+
+---
+
+## Table of Contents
+
+1. [Why Caching Exists](#1-why-caching-exists)
+2. [The Full Request Flow](#2-the-full-request-flow)
+3. [External Caching (Redis/Memcached)](#3-external-caching-redismemcached)
+4. [CDN Caching](#4-cdn-caching)
+5. [Client-Side Caching](#5-client-side-caching)
+6. [In-Process Caching](#6-in-process-caching)
+7. [CDN vs Redis — They Are Separate Systems](#7-cdn-vs-redis--they-are-separate-systems)
+8. [Cache Architectures](#8-cache-architectures)
+9. [Eviction Policies](#9-eviction-policies)
+10. [Common Caching Problems](#10-common-caching-problems)
+11. [The 5-Step Interview Framework](#11-the-5-step-interview-framework)
+12. [Interview-Ready One-Liners](#interview-ready-one-liners)
+13. [Quick Reference: Decision Matrix](#quick-reference-decision-matrix)
+14. [Final Mental Models](#final-mental-models)
+15. [What's Next](#whats-next-recommended-topics)
+
+---
+
+## 1. Why Caching Exists
+
+### Q: Why is a database so much slower than a cache?
+
+It comes down to where data physically lives. Databases store data on disk (SSD/HDD) — every query pays the cost of disk I/O. Caches like Redis store data in RAM, which is physically closer to the CPU with no seek operations.
+
+| Storage | Medium | Latency |
+|---------|--------|---------|
+| Database (Postgres) | Disk (SSD/HDD) | ~50ms |
+| Cache (Redis) | RAM | ~1ms |
+
+That's a 50x improvement. It's not that Postgres is badly written — any disk-based system pays a tax that memory-based systems skip entirely.
+
+### Q: When should caching be introduced?
+
+When you identify one of these problems:
+
+- **Read-heavy workload:** 200M reads/day hitting the database
+- **Expensive queries:** Joins across multiple tables taking 200ms
+- **High DB CPU:** 80%+ during peak hours from repeated identical queries
+- **Latency requirements:** Need sub-10ms responses but DB queries take 30-50ms
+
+---
+
+## 2. The Full Request Flow
+
+### Q: What path does a user request take through all caching layers?
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  USER'S DEVICE                                                  │
+│  ① Browser/App Cache  → "Do I already have this locally?"       │
+└──────────────┬──────────────────────────────────────────────────┘
+               │ (cache miss)
+               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  CDN EDGE SERVER (nearest city)                                 │
+│  ② CDN Cache  → "Do I have a cached copy at the edge?"         │
+└──────────────┬──────────────────────────────────────────────────┘
+               │ (cache miss)
+               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  YOUR DATA CENTER                                               │
+│  ③ Load Balancer → picks an app server                         │
+│  ④ Application Server                                           │
+│  ⑤ External Cache (Redis) → "Is this in memory already?"       │
+│  ⑥ Database (Postgres) → query disk, return data               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Q: Where does each layer save time?
+
+| Layer | Latency if hit | What it avoids |
+|-------|---------------|----------------|
+| Browser cache | 0ms | Entire network round-trip |
+| CDN | 20-40ms | Cross-continent trip to origin |
+| Redis | 1ms | Database disk I/O |
+| DB buffer pool | 5-10ms | Full disk read |
+| Full DB query | 20-50ms+ | Nothing — last resort |
+
+In a well-cached system, 90% of static asset requests stop at CDN and 80-95% of data requests stop at Redis. Only 5-20% actually hit the database.
+
+---
+
+## 3. External Caching (Redis/Memcached)
+
+### Q: What is an external cache?
+
+A separate service (Redis, Memcached) that the application talks to over the network. It stores frequently accessed data in-memory so the database doesn't get hit every time.
+
+### Q: Why is it the default interview answer?
+
+- **Shared** — all app servers hit the same Redis (no duplication)
+- **Fast** — ~1ms even over network (in-memory)
+- **Controlled** — LRU eviction and TTL prevent unbounded growth
+- **Simple model** — check cache → miss = query DB → populate cache → return
+
+### Q: What's the basic flow?
+
+```
+App receives request for user #42's profile
+  → Check Redis: "user:42" exists?
+    → YES (cache hit): return cached JSON (1ms)
+    → NO (cache miss): query Postgres (50ms), store in Redis, return
+```
+
+---
+
+## 4. CDN Caching
+
+### Q: What does a CDN actually do?
+
+A CDN (Content Delivery Network) is a geographically distributed network of servers that caches content close to users. Instead of every request traveling to your origin server, nearby edge servers serve cached copies.
+
+Without CDN: server in Virginia, user in India = 250-300ms per image.
+With CDN: edge server in India = 20-40ms.
+
+### Q: How does content get to an edge server?
+
+Pull-based (lazy) model — content only appears at an edge when someone in that region requests it:
+
+1. First request from Mumbai → CDN edge says "I don't have this" (miss)
+2. Edge fetches from origin (~300ms one-time cost)
+3. Edge stores it locally
+4. All subsequent Mumbai requests → served from edge (30ms)
+
+### Q: Does every edge server have ALL content?
+
+No. Edge servers use LRU/TTL eviction — only recently/frequently accessed content for that region stays cached. A tiny fraction (~0.005% of total) serves 90%+ of requests because access patterns follow a power law.
+
+### Q: What happens on a CDN cache miss?
+
+CDNs have a tiered architecture:
+
+```
+Edge (Mumbai) → miss → Regional Hub (Singapore) → miss → Origin (US)
+```
+
+The regional/shield tier prevents many edges from all hammering origin for the same content. Origin gets hit once per region, not once per edge.
+
+### Q: Instagram CDN Example
+
+Instagram serves billions of images daily to users in 190+ countries. A viral post viewed 10M times only hits origin maybe 50 times (once per region). The CDN absorbs 99.99% of image traffic.
+
+Prefetching (loading next 3-5 reels in background) + algorithmic ordering (popular content first) + CDN together make the feed feel instant even for less popular content.
+
+---
+
+## 5. Client-Side Caching
+
+### Q: What is client-side caching?
+
+Data stored on the user's device (browser HTTP cache, localStorage, mobile app storage) to avoid any network call at all. Latency: effectively 0ms.
+
+### Q: What's the trade-off?
+
+Fastest cache possible but hardest to invalidate. With Redis, delete the key and it's gone. With a user's device, you can't force them to clear their cache.
+
+| Control level | Cache type |
+|---------------|-----------|
+| Full control | Redis (you own it) |
+| Partial control | CDN (set headers/TTL) |
+| Barely any control | Client-side (user's device) |
+
+### Q: When to use it?
+
+- "App should work offline" → local storage + sync on reconnect (Strava pattern)
+- "Reduce API calls for repeated page views" → browser HTTP cache
+- "Mobile app performance" → in-memory cache for recently accessed data
+- "User preferences / settings" → localStorage (rarely changes, read constantly)
+
+---
+
+## 6. In-Process Caching
+
+### Q: What is in-process caching?
+
+A HashMap/dictionary inside the application process caching hot data. Even faster than Redis because there's no network hop at all — just a local memory read (~microseconds).
+
+### Q: What data belongs here?
+
+Only things that are small, hot, and rarely change:
+
+- Feature flags
+- Configuration values
+- Rate limit counters
+- Small reference datasets (country codes, currency mappings)
+- Hot keys accessed 10,000x/sec
+
+### Q: What's the limitation?
+
+Each server has its own cache — not shared. If Server A's cache says `feature_flag = ON` but Server B's says `OFF` (stale), there's inconsistency. Mitigate with short TTLs (30s) or pub/sub notifications.
+
+### Q: When to mention it in interviews?
+
+Never lead with it. Mention AFTER Redis as an optimization layer:
+> "For feature flags and config, we can add an in-process cache with a 30-second TTL to avoid even the Redis hop on every request."
+
+---
+
+## 7. CDN vs Redis — They Are Separate Systems
+
+### Q: Do CDN edge servers use Redis?
+
+No. CDN and Redis are completely independent systems that never talk to each other. They handle different types of requests:
+
+```
+STATIC FILES (images, video, CSS):
+    User → CDN Edge → CDN Regional → Origin Storage (S3)
+    Redis is NOT involved.
+
+DYNAMIC DATA (profiles, feeds, search results):
+    User → App Server → Redis → Database
+    CDN is NOT involved.
+```
+
+### Q: Why not combine them?
+
+| Reason | Explanation |
+|--------|-------------|
+| Different data types | CDN caches 2MB images. Redis caches 1KB JSON. |
+| Geography | CDN edges in 200+ cities. Redis in your data center. Edge calling Redis defeats the purpose. |
+| Self-sufficient design | CDN edges serve without calling anything else. Adding Redis as dependency adds latency. |
+
+CDN edge servers have their own local SSD + RAM storage. They don't need an external cache.
+
+---
+
+## 8. Cache Architectures
+
+### Q: What is Cache-Aside (Lazy Loading)?
+
+The default pattern — use this in interviews unless there's a specific reason not to.
+
+1. App checks Redis
+2. Hit → return cached data
+3. Miss → query DB → store result in Redis → return
+
+**Pros:** Only caches data that's actually read. Simple. DB is always source of truth.
+**Cons:** First request after a miss is slower (cache population overhead).
+
+### Q: What is Write-Through?
+
+App writes to cache, cache synchronously writes to DB. Write isn't complete until both are updated.
+
+**Pros:** Cache always has fresh data after writes.
+**Cons:** Slower writes (waiting for both). Requires specialized library. Dual-write consistency risk.
+
+### Q: What is Write-Behind (Write-Back)?
+
+App writes only to cache. Cache batches and flushes to DB asynchronously in background.
+
+**Pros:** Extremely fast writes.
+**Cons:** Data loss risk if cache crashes before flushing. Eventual consistency only.
+**Use case:** Analytics pipelines, metrics, where occasional data loss is acceptable.
+
+### Q: What is Read-Through?
+
+Cache acts as a proxy — app never talks to DB directly. On miss, cache itself fetches from DB.
+
+**Pros:** Centralizes caching logic.
+**Cons:** Requires specialized caching service.
+**Note:** CDNs are a form of read-through cache. For app-level Redis, cache-aside is far more common.
+
+### Q: Why is Cache-Aside the default interview answer?
+
+| Reason | Explanation |
+|--------|-------------|
+| Simpler infrastructure | Works with plain Redis out of the box |
+| No wasted cache space | Only caches data being actively read |
+| DB as source of truth | Easier to reason about consistency |
+| Read-optimized | Most systems are read-heavy (100 reads per 1 write) |
+
+---
+
+## 9. Eviction Policies
+
+### Q: Which eviction policy should I pick?
+
+| Policy | Rule | Best for | Interview default? |
+|--------|------|----------|-------------------|
+| **LRU** | Kick out least recently accessed | Most workloads | Yes — always safe |
+| **LFU** | Kick out least frequently accessed | Consistently popular keys (trending, leaderboards) | Only if asked |
+| **FIFO** | Kick out oldest by insertion time | Almost never | Don't propose |
+| **TTL** | Expire after set time | Forcing freshness (combine with LRU/LFU) | Always combine |
+
+> Interview move: "LRU with a 5-10 minute TTL" covers 90% of scenarios.
+
+---
+
+## 10. Common Caching Problems
+
+### Q: What is a Cache Stampede (Thundering Herd)?
+
+A popular key expires and thousands of requests simultaneously miss the cache and flood the database.
+
+**Example:** "Top 10 Trending Posts" cached with 60s TTL. At peak (50k req/sec), TTL expires → all requests hit DB at once.
+
+**Fix:** Request coalescing (single-flight) — only one request rebuilds the cache, all others wait for that result.
+
+### Q: What is the Cache Consistency problem?
+
+Cache and DB return different values. User updates profile picture → DB has new one, cache still has old one.
+
+**Fixes:**
+- Invalidate on writes (delete cache key after DB update)
+- Short TTLs (accept data can be stale for X seconds)
+- Accept eventual consistency (fine for feeds, metrics)
+
+### Q: What is a Hot Key problem?
+
+One cache key receives disproportionate traffic (e.g., Taylor Swift's profile on Twitter) and overloads a single Redis node.
+
+**Fixes:**
+- Replicate hot key across multiple cache nodes
+- In-process cache fallback for extremely hot keys
+- Rate limiting on abusive patterns
+
+---
+
+## 11. The 5-Step Interview Framework
+
+When introducing caching in a system design interview:
+
+```
+1. BOTTLENECK  → "Profile reads hit DB 500/sec at 30ms each"
+2. WHAT        → "Cache user profiles (read 100x, written 1x per day)"
+3. PATTERN     → "Cache-aside with Redis"
+4. EVICTION    → "LRU + 10-min TTL, invalidate on write"
+5. FAILURES    → "Stampede → coalescing. Redis down → circuit breaker + DB fallback"
+```
+
+### What NOT to cache
+
+| Cache it | Don't cache it |
+|----------|---------------|
+| Read 1000x/sec, written 1x/hour | Written as often as read |
+| Expensive JOIN across 4 tables | Simple indexed lookup (5ms) |
+| Same result for many users | Unique per request (search with filters) |
+| Latency requirement < 10ms | 100ms is acceptable |
+
+---
+
+## Interview-Ready One-Liners
+
+### "Why use a cache?"
+> "Reading from Postgres takes 50ms (disk). Reading from Redis takes 1ms (RAM). For read-heavy workloads, caching cuts latency 50x and takes 80-95% of load off the database."
+
+### "Which caching pattern would you use?"
+> "Cache-aside. On read, check Redis first. On miss, query DB, store in Redis, return. On write, update DB then invalidate the cache key. Simple, and the DB stays the source of truth."
+
+### "How do you prevent a cache stampede?"
+> "Request coalescing — the first request that sees the miss acquires a lock, rebuilds the cache, and all concurrent requests wait for that result instead of each hitting the DB."
+
+### "When would you use a CDN?"
+> "When serving static content (images, video, CSS) to geographically distributed users. CDN caches files at edge servers worldwide — 30ms vs 300ms for cross-continent requests."
+
+### "Should we cache personalized API responses on a CDN?"
+> "No — CDN works because many users share the same cached content. Personalized responses are unique per user, so cache hit rate would be near zero. Use Redis at the app layer instead."
+
+### "What happens if Redis goes down?"
+> "Requests fall back to the database. We add circuit breakers to prevent a stampede from crushing the DB, and optionally keep an in-process cache as a last-resort layer for the hottest keys."
+
+---
+
+## Quick Reference: Decision Matrix
+
+### Which caching layer to use?
+
+| Signal in the problem | Layer to propose |
+|----------------------|-----------------|
+| "Serves images/media at scale" | CDN |
+| "Global users, latency matters" | CDN |
+| "High read traffic on DB" | Redis (external cache) |
+| "Expensive queries repeated often" | Redis |
+| "Feature flags / config" | In-process cache |
+| "App should work offline" | Client-side cache |
+| "Reduce API calls from same user" | Browser HTTP cache |
+
+### Cache Architecture Decision
+
+| Requirement | Pattern |
+|------------|---------|
+| Default / most systems | Cache-aside |
+| Must read fresh after every write | Write-through |
+| Ultra-high write throughput, loss OK | Write-behind |
+| Infrastructure handles caching (CDN) | Read-through |
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| External cache (Redis) | Shared whiteboard in the office hallway — anyone can read, fast to check |
+| CDN | Franchise pickup points in every city — local access, stocked with popular items |
+| Client-side cache | Pamphlet you handed out — fast to read, impossible to recall and update |
+| In-process cache | Sticky note on YOUR monitor — instant, but coworkers can't see it |
+| Cache-aside | Check the whiteboard → not there? → go to filing cabinet → write it on whiteboard |
+| Write-through | Receptionist logs you in computer AND sticky note simultaneously |
+| Write-behind | Drop it in the inbox tray — someone files it later (might get lost) |
+| Cache stampede | 1000 people asking for the same file the moment it's removed from the shelf |
+| CDN edge miss | Convenience store is out of stock → asks regional warehouse → gets restocked |
+| LRU eviction | Library removes books nobody's checked out in 6 months |
+| Hot key | Everyone in the company printing from one printer — it overheats |
+
+---
+
+## What's Next (Recommended Topics)
+
+1. **Database Indexing** — B-trees, hash indexes, composite indexes (what caching can't solve)
+2. **Load Balancing** — How requests get distributed across app servers (Layer 4 vs Layer 7)
+3. **Message Queues** — Async processing, decoupling writes (Kafka, RabbitMQ)
+4. **Database Replication** — Read replicas as an alternative/complement to caching
+5. **Rate Limiting** — Token bucket, sliding window (often paired with caching)
+
+---
+
+*Created from a deep-dive study session on caching strategies. Designed for L1/L2 system design interview prep (2-4 YOE backend engineers).*
