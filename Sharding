@@ -1,0 +1,395 @@
+# Database Sharding — Complete Study Guide
+
+> A comprehensive Q&A guide covering partitioning vs sharding, shard key selection, sharding strategies (range, hash, directory), hot spots, cross-shard operations, consistency challenges, and interview tactics.
+> Designed for L1/L2 system design interviews — 2-4 YOE.
+
+---
+
+## Table of Contents
+
+1. [Partitioning vs Sharding](#1-partitioning-vs-sharding)
+2. [Why Shard — The Scaling Ceiling](#2-why-shard--the-scaling-ceiling)
+3. [Choosing a Shard Key](#3-choosing-a-shard-key)
+4. [Sharding Strategies](#4-sharding-strategies)
+5. [Hot Spots and Load Imbalance](#5-hot-spots-and-load-imbalance)
+6. [Cross-Shard Operations](#6-cross-shard-operations)
+7. [Maintaining Consistency](#7-maintaining-consistency)
+8. [Sharding in Modern Databases](#8-sharding-in-modern-databases)
+9. [Interview Playbook](#9-interview-playbook)
+
+---
+
+## 1. Partitioning vs Sharding
+
+### Q: What's the actual difference between partitioning and sharding?
+
+**Partitioning** splits a large table into smaller pieces *inside a single database instance*. No new machines — just better organization so the database works more efficiently.
+
+**Sharding** splits data *across multiple machines*. Each shard is a standalone database with its own CPU, memory, and storage.
+
+In practice, most engineers use the terms loosely. The distinction that matters in an interview: is your data on one machine or many?
+
+### Q: What are the two types of partitioning?
+
+| Type | What it splits | Example |
+|------|---------------|---------|
+| **Horizontal** | Rows | One partition per year of orders. Same columns, fewer rows per partition. |
+| **Vertical** | Columns | Frequently accessed columns in one partition, large blobs in another. Same rows, fewer columns per partition. |
+
+Sharding is essentially horizontal partitioning taken across machine boundaries.
+
+### Q: When does partitioning (within one machine) stop being enough?
+
+When you have a 500M-row, 2TB table and:
+- Queries scan the whole thing even with indexes
+- Index maintenance itself becomes a bottleneck
+- Routine operations (VACUUM, ANALYZE, index rebuilds) lock the table
+- You're approaching single-machine storage limits (~256 TiB for Aurora)
+
+Partitioning helps with scan efficiency but doesn't solve write throughput or storage ceiling problems.
+
+---
+
+## 2. Why Shard — The Scaling Ceiling
+
+### Q: What triggers the need for sharding?
+
+Three bottlenecks that vertical scaling can't solve forever:
+
+| Bottleneck | Signal | Example |
+|-----------|--------|---------|
+| **Storage** | Approaching machine limits | 500M users × 5KB = 2.5TB, growing 10x |
+| **Write throughput** | Single DB can't absorb writes | 50K writes/sec at peak |
+| **Read throughput** | Read replicas aren't enough | 100M DAU making multiple queries each |
+
+The progression: upgrade hardware → add read replicas → partition within one DB → **shard across machines**. Each step buys time until the next ceiling.
+
+### Q: What's the formula for deciding "we need to shard" in an interview?
+
+```
+1. Identify the bottleneck (storage, writes, or reads)
+2. Explain why a single database won't scale
+3. Propose sharding with a specific shard key
+```
+
+Never introduce sharding before proving it's necessary. Do the math first.
+
+---
+
+## 3. Choosing a Shard Key
+
+### Q: What makes a good shard key?
+
+Three properties, all required:
+
+| Property | Why it matters | Bad example |
+|----------|---------------|-------------|
+| **High cardinality** | Many unique values = room to distribute | `is_premium` (boolean) → max 2 shards |
+| **Even distribution** | No shard gets disproportionate load | `country` when 90% of users are in one country |
+| **Aligns with queries** | Common queries hit one shard | Sharding orders by `user_id` when most queries are "get this user's orders" |
+
+### Q: Give me good and bad shard key examples.
+
+**Good:**
+- `user_id` for a user-centric app — millions of values, even distribution, queries scoped to one user
+- `order_id` for an e-commerce orders table — high cardinality, queries scoped to specific orders
+
+**Bad:**
+- `is_premium` (boolean) — only 2 possible shards, one overloaded
+- `created_at` for a growing table — all new writes hit the most recent shard (write hot spot)
+- `country` with skewed user distribution — one shard gets hammered
+
+### Q: Why is "aligns with queries" the most underrated property?
+
+Because even if distribution is perfect, a shard key that doesn't match your access patterns means every common query becomes a scatter-gather across all shards. If you shard by `order_id` but your most frequent query is "get all orders for user X," you're hitting every shard on every request. The shard key should make your *hot path* a single-shard lookup.
+
+---
+
+## 4. Sharding Strategies
+
+### Q: What are the three main sharding strategies and when do you use each?
+
+| Strategy | Mechanism | Best for | Watch out for |
+|----------|-----------|----------|---------------|
+| **Range-based** | Assign contiguous value ranges to shards | Multi-tenant systems, range scans | Hot spots on recent ranges |
+| **Hash-based** | `hash(key) % N` to pick shard | General-purpose, even distribution | Resharding pain without consistent hashing |
+| **Directory-based** | Lookup table maps keys → shards | Maximum flexibility, celebrity isolation | Single point of failure, extra latency |
+
+### Q: How does range-based sharding work?
+
+Assign contiguous ranges of your shard key to each shard:
+
+```
+Shard 1 → User IDs 1–1M
+Shard 2 → User IDs 1M–2M
+Shard 3 → User IDs 2M–3M
+```
+
+**Pros:** Simple, efficient range scans (all data in a range is co-located).
+
+**Cons:** Uneven access patterns. If you shard by `created_at`, all writes pile onto the latest shard. Works best when different users naturally query different ranges (e.g., SaaS multi-tenant where each company has its own ID range).
+
+### Q: How does hash-based sharding work?
+
+Apply a hash function to the shard key and modulo by shard count:
+
+```
+shard = hash(user_id) % 4
+
+User 42  → Shard 2
+User 99  → Shard 3
+User 123 → Shard 1
+```
+
+**Pros:** Even distribution regardless of input pattern.
+
+**Cons:** Adding/removing shards changes the modulo, remapping nearly every record. Solution: use **consistent hashing** to minimize data movement during resharding.
+
+This is the **default strategy** interviewers assume you're using unless you say otherwise.
+
+### Q: What's the problem with naive hash-based sharding when you add shards?
+
+Going from 4 → 5 shards changes `% 4` to `% 5`. Almost every record maps to a different shard — massive data migration. Consistent hashing solves this by only remapping ~1/N of keys when adding a shard (where N is the new shard count).
+
+### Q: Why is directory-based sharding rarely the right answer in interviews?
+
+It introduces:
+- A **single point of failure** (directory service down = entire system down)
+- **Extra latency** on every request (must look up shard before querying)
+- Complexity that prompts follow-up questions that can derail the conversation
+
+Use it only when you need to isolate specific hot keys (celebrity accounts) or have complex routing logic impossible with a formula.
+
+---
+
+## 5. Hot Spots and Load Imbalance
+
+### Q: What causes hot spots even with a good shard key?
+
+Two main causes:
+
+**The celebrity problem:** Some keys are inherently more active. Taylor Swift's `user_id` generates 1000x more traffic than a normal user. Hash distribution doesn't help because the problem is the key's popularity, not its placement.
+
+**Time-based skew:** Sharding by `created_at` means all new writes hit the latest shard. Older shards sit idle.
+
+### Q: How do you handle hot spots?
+
+| Solution | How it works | Trade-off |
+|----------|-------------|-----------|
+| **Isolate hot keys** | Move celebrity accounts to dedicated shards | Requires directory-style mapping for those keys |
+| **Compound shard keys** | `hash(user_id + date)` spreads one user across shards over time | Queries for "all of user X's data" now span shards |
+| **Dynamic shard splitting** | Auto-split when a shard gets too hot/large | Database-dependent (MongoDB balancer does this, Vitess requires operator action) |
+
+### Q: How do you detect hot spots in production?
+
+Monitor per-shard metrics:
+- Query latency (p99)
+- CPU usage
+- Request volume
+- Disk I/O
+
+When one shard consistently shows higher metrics than others, you have a hot spot.
+
+---
+
+## 6. Cross-Shard Operations
+
+### Q: Why are cross-shard queries expensive?
+
+A query that doesn't align with the shard key must:
+1. Fan out to all N shards
+2. Wait for all N responses (latency = slowest shard)
+3. Merge and aggregate results client-side
+
+If you have 64 shards, "top 10 most popular posts globally" = 64 network calls, 64 responses to merge. Compare that to a single-shard query: 1 call, done.
+
+### Q: How do you minimize cross-shard queries?
+
+| Approach | When to use |
+|----------|-------------|
+| **Cache results** | Queries that don't need real-time accuracy (leaderboards, trending, aggregate stats) |
+| **Denormalize** | Keep related data together on the same shard, even if it duplicates data |
+| **Pre-compute with background jobs** | Global aggregations computed periodically, results stored in a fast lookup |
+| **Accept the hit** | Rare admin/analytics queries that don't need to be fast |
+
+### Q: What's the interview signal when you keep saying "query all shards"?
+
+It means your shard key doesn't align with your access patterns. Pause and rethink:
+- Can you denormalize to avoid the fan-out?
+- Can you cache or pre-compute?
+- Should you pick a different shard key?
+
+Interviewers expect you to minimize cross-shard queries, not just accept them.
+
+---
+
+## 7. Maintaining Consistency
+
+### Q: Why does sharding break traditional transactions?
+
+A single-database transaction wraps multiple operations atomically — both succeed or both fail. When user A's account is on shard 1 and user B's account is on shard 2, no single database transaction spans both. You're coordinating writes across independent databases that don't know about each other.
+
+### Q: What's two-phase commit (2PC) and why do most systems avoid it?
+
+**2PC protocol:**
+1. Coordinator asks all shards to *prepare* (lock resources)
+2. All shards confirm ready
+3. Coordinator tells everyone to *commit*
+
+**Why it's avoided:** Slow (multiple round-trips), fragile (if coordinator or any shard fails mid-protocol, system gets stuck), and creates lock contention across shards.
+
+### Q: What are the practical alternatives to 2PC?
+
+| Approach | How it works | Best for |
+|----------|-------------|----------|
+| **Design to avoid cross-shard txns** | Keep all of a user's data on their shard | Most cases — the best solution |
+| **Saga pattern** | Break into steps, each with a compensating (undo) action | When cross-shard coordination is unavoidable |
+| **Accept eventual consistency** | Let shards converge over time | Follower counts, view counts, denormalized copies |
+
+**Saga example — money transfer between users on different shards:**
+1. Deduct from User A (shard 1)
+2. Add to User B (shard 2)
+3. If step 2 fails → compensate: refund User A
+
+### Q: What's the TLDR on consistency with sharding?
+
+If you constantly need distributed transactions, you probably chose the wrong shard key or the wrong shard boundaries. Redesign so the common-case operations are single-shard.
+
+---
+
+## 8. Sharding in Modern Databases
+
+### Q: How do popular databases handle sharding internally?
+
+| Database | Mechanism | Key behavior |
+|----------|-----------|--------------|
+| **Cassandra** | Consistent hashing with virtual nodes (Murmur3Partitioner) | Token ranges mapped to nodes |
+| **DynamoDB** | Internal hash-based partitioning | Auto-splits/merges partitions as they grow |
+| **MongoDB** | Range-based chunks on shard key (hashed shard key = ranges over hash space) | Background balancer auto-migrates chunks |
+| **Vitess** | Sharding layer over MySQL | Operator-driven online resharding |
+| **Citus** | Sharding layer over PostgreSQL | Distributed queries, co-located joins |
+| **Spanner** | Built-in distributed SQL | Automatic sharding with strong consistency |
+
+### Q: What's enough to say in an interview about database choice?
+
+"We'll use DynamoDB with `user_id` as the partition key" or "We'll shard Postgres using Vitess on `user_id` with operator-driven resharding." You don't need to implement sharding internals unless specifically asked.
+
+---
+
+## 9. Interview Playbook
+
+### Q: When should you bring up sharding in an interview?
+
+Only after establishing a bottleneck through capacity math:
+
+```
+"We have 500M users × 5KB = 2.5TB. Single Postgres handles that today,
+but at 10x growth we'll need to shard."
+
+"50K writes/sec at peak exceeds what a single instance can handle.
+We should shard to distribute write load."
+```
+
+The #1 mistake: introducing sharding before proving it's necessary.
+
+### Q: What's the interview walkthrough script?
+
+**Step 1 — Propose shard key based on access patterns:**
+> "Most queries are user-centric — loading feeds, profiles, likes — all scoped to one user. I'd shard by `user_id`."
+
+**Step 2 — Choose distribution strategy:**
+> "Hash-based with consistent hashing. Distributes users evenly, minimizes data movement when adding shards."
+
+**Step 3 — Call out trade-offs:**
+> "Global queries like 'trending posts' become expensive — they fan out to all shards. We'd cache trending content and pre-compute with background jobs."
+
+**Step 4 — Address growth:**
+> "Start with 64 shards for headroom. Consistent hashing lets us add capacity later with minimal data movement."
+
+### Q: What are the common interview mistakes with sharding?
+
+| Mistake | Why it's bad | Fix |
+|---------|-------------|-----|
+| Sharding too early | Shows you don't understand when it's needed | Do capacity math first |
+| No shard key justification | Shows you picked randomly | Explain why it aligns with access patterns |
+| Ignoring cross-shard queries | Shows incomplete thinking | Acknowledge and propose mitigation |
+| Using directory-based without strong justification | Opens a can of follow-up questions | Default to hash-based |
+| Forgetting resharding | Shows you haven't thought about growth | Mention consistent hashing |
+
+---
+
+## Interview-Ready One-Liners
+
+### "When would you shard a database?"
+> "When a single machine hits its ceiling on storage, write throughput, or read throughput — and vertical scaling plus read replicas aren't enough anymore."
+
+### "How do you pick a shard key?"
+> "High cardinality, even distribution, and alignment with your most common queries. For a user-centric app, that's almost always user_id."
+
+### "What's the default sharding strategy?"
+> "Hash-based with consistent hashing. Even distribution, minimal data movement on resharding. It's what interviewers assume unless you say otherwise."
+
+### "How do you handle hot spots?"
+> "Isolate hot keys to dedicated shards, use compound shard keys to spread load over time, or rely on the database's auto-balancing if available."
+
+### "What about cross-shard joins?"
+> "Minimize them by choosing a shard key that aligns with access patterns. For unavoidable cases: cache, denormalize, or pre-compute with background jobs."
+
+### "How do you maintain consistency across shards?"
+> "Design so common operations stay single-shard. For the rare cross-shard case, use the saga pattern with compensating actions rather than 2PC."
+
+---
+
+## Quick Reference: Sharding Decision Tree
+
+```
+Is your DB hitting storage/write/read limits?
+├── No → Don't shard. Optimize queries, add read replicas, partition within one DB.
+└── Yes → Shard.
+        │
+        ├── What's your most common query pattern?
+        │   ├── User-scoped → shard by user_id
+        │   ├── Entity-scoped → shard by entity_id (order_id, etc.)
+        │   └── Time-scoped → careful! consider compound key
+        │
+        ├── Which distribution strategy?
+        │   ├── Need even distribution (default) → Hash-based + consistent hashing
+        │   ├── Need range scans / multi-tenant → Range-based
+        │   └── Need per-key flexibility → Directory-based (rare)
+        │
+        └── How to handle the hard parts?
+            ├── Hot spots → isolate, compound keys, auto-split
+            ├── Cross-shard queries → cache, denormalize, pre-compute
+            └── Consistency → single-shard design, sagas, eventual consistency
+```
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| Partitioning | Filing cabinet with labeled drawers — same cabinet, better organization |
+| Sharding | Opening branch offices — each handles its own customers independently |
+| Shard key | Mailing address — determines which post office handles your mail |
+| Hash-based sharding | Shuffling a deck of cards evenly across players |
+| Range-based sharding | Splitting a phone book A-M and N-Z |
+| Consistent hashing | A circular track where adding a runner only shifts their nearest neighbors |
+| Hot spot | One checkout lane with a celebrity while others are empty |
+| Cross-shard query | Calling every branch office to find one piece of info |
+| Saga pattern | Writing checks with a "void if not cashed" clause on each step |
+| 2PC | Everyone holds hands and jumps together — if one person lets go, everyone falls |
+
+---
+
+## What's Next (Recommended Topics)
+
+1. **Consistent Hashing** — the mechanism that makes hash-based resharding practical
+2. **Database Replication** — read replicas, leader-follower, multi-leader patterns
+3. **CAP Theorem & Consistency Models** — eventual vs strong consistency trade-offs
+4. **Distributed Transactions** — sagas, outbox pattern, idempotency in depth
+5. **Database Indexing** — B-trees, LSM trees, and how indexes interact with sharded data
+
+---
+
+*Created from a deep-dive study session on database sharding. Designed for L1/L2 system design interviews (2-4 YOE).*
