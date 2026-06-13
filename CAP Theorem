@@ -1,0 +1,308 @@
+# CAP Theorem — Complete Study Guide
+
+> A comprehensive Q&A guide covering what CAP theorem is, why partition tolerance is non-negotiable, the consistency vs. availability trade-off, when to choose each, mixed consistency in real systems, and the full spectrum of consistency models.
+> Designed for L1/L2 system design interviews — 2-4 YOE.
+
+---
+
+## Table of Contents
+
+1. [What CAP Theorem Actually Says](#1-what-cap-theorem-actually-says)
+2. [The Real Choice: Consistency vs. Availability](#2-the-real-choice-consistency-vs-availability)
+3. [When to Choose Consistency](#3-when-to-choose-consistency)
+4. [When to Choose Availability](#4-when-to-choose-availability)
+5. [Mixed Consistency Within One System](#5-mixed-consistency-within-one-system)
+6. [The Consistency Spectrum](#6-the-consistency-spectrum)
+7. [Applying CAP in System Design Interviews](#7-applying-cap-in-system-design-interviews)
+
+---
+
+## 1. What CAP Theorem Actually Says
+
+### Q: What are the three properties in CAP theorem?
+
+| Property | Meaning |
+|----------|---------|
+| **Consistency** | All nodes see the same data at the same time. A write to one node means all subsequent reads from any node return the updated value. |
+| **Availability** | Every request to a non-failing node receives a response (though not necessarily the most recent data). |
+| **Partition Tolerance** | The system continues to operate despite network failures between nodes (messages lost or delayed indefinitely). |
+
+CAP states you can only guarantee two of these three simultaneously in a distributed system.
+
+### Q: Is CAP consistency the same as ACID consistency?
+
+No — they're different concepts that share a name.
+
+- **CAP consistency** = linearizability. All nodes see the same data at the same time. It's about replication across distributed nodes.
+- **ACID consistency** = the database moves from one valid state to another. It's about integrity constraints (foreign keys, unique constraints, etc.) within a single database.
+
+A system can satisfy ACID consistency while violating CAP consistency (e.g., a single-node database with referential integrity but no replication).
+
+### Q: Why is partition tolerance non-negotiable?
+
+Network partitions aren't a choice — they're a fact of distributed systems. Cables get cut, switches fail, cloud availability zones lose connectivity. If your system spans more than one node, partitions will happen.
+
+Since you must tolerate partitions, CAP reduces to a single binary choice: **when a partition occurs**, do you sacrifice consistency or availability?
+
+---
+
+## 2. The Real Choice: Consistency vs. Availability
+
+### Q: What does choosing consistency look like during a partition?
+
+Two servers — USA and Europe. User A updates their display name on the USA server. The network link between USA and Europe goes down.
+
+**Choosing consistency:** When User B in Europe requests User A's profile, the system returns an error (or blocks) because it cannot guarantee the data is up-to-date. The system refuses to serve potentially stale data.
+
+Result: Some users get errors or timeouts, but no one ever sees incorrect data.
+
+### Q: What does choosing availability look like during a partition?
+
+Same scenario. Network link is down.
+
+**Choosing availability:** When User B requests User A's profile, the Europe server returns whatever data it has — even if it's the old display name. The system always responds, even if the response is stale.
+
+Result: Everyone gets a response, but some users might temporarily see outdated information.
+
+### Q: What's the one question that decides the choice?
+
+> "Would it be catastrophic if users briefly saw inconsistent data?"
+
+- **Yes** → choose consistency
+- **No** → choose availability
+
+---
+
+## 3. When to Choose Consistency
+
+### Q: What are classic examples where consistency is mandatory?
+
+| System | Why consistency is critical |
+|--------|---------------------------|
+| **Ticket/seat booking** | Two users booking the same seat = double-booking disaster |
+| **E-commerce inventory** | One toothbrush left, shown as available to 5 users = overselling |
+| **Financial/trading systems** | Stale order book = trades at incorrect prices, real money lost |
+| **Bank transfers** | Balance must never be stale; overdrafts from stale reads are unacceptable |
+
+### Q: What design patterns support consistency?
+
+**Distributed transactions (two-phase commit):** Ensures multiple data stores remain in sync. Adds latency but guarantees all nodes agree before acknowledging a write.
+
+**Single-node solutions:** Use one database instance as the source of truth. Eliminates consistency challenges entirely but limits horizontal scalability.
+
+**Technology choices:**
+- PostgreSQL / MySQL (single-leader replication with synchronous followers)
+- Google Spanner (globally consistent via TrueTime)
+- DynamoDB in strong consistency mode
+- ZooKeeper / etcd (for coordination data)
+
+---
+
+## 4. When to Choose Availability
+
+### Q: What are classic examples where availability wins?
+
+| System | Why availability is fine |
+|--------|------------------------|
+| **Social media profiles** | Seeing an old profile picture for 30 seconds is harmless |
+| **Content platforms (Netflix)** | Stale movie description temporarily is not catastrophic |
+| **Review sites (Yelp)** | Slightly outdated restaurant hours briefly is better than no info at all |
+| **DNS** | Propagation takes minutes; the internet works fine with this |
+| **News feeds** | Missing the latest post for a few seconds doesn't matter |
+
+### Q: What design patterns support availability?
+
+**Multiple read replicas with async replication:** Reads served from any replica even if slightly behind. Improves read throughput and availability at the cost of staleness.
+
+**Change Data Capture (CDC):** Track changes in the primary database and propagate asynchronously to replicas, caches, search indexes. The primary stays available while updates flow eventually.
+
+**Technology choices:**
+- Cassandra (multi-master, tunable consistency)
+- DynamoDB in multi-AZ configuration
+- Redis clusters
+- MongoDB with secondary reads
+
+---
+
+## 5. Mixed Consistency Within One System
+
+### Q: Can a single system use both consistency and availability for different features?
+
+Yes — and this is the nuanced answer interviewers love. Real systems don't make one global choice; they make per-feature choices.
+
+**Ticketmaster example:**
+
+| Feature | Choice | Reason |
+|---------|--------|--------|
+| Booking a seat | Consistency | Double-booking is catastrophic |
+| Viewing event details | Availability | Stale description for a few seconds is fine |
+| Browsing available events | Availability | Slightly outdated availability count is acceptable |
+| Payment processing | Consistency | Financial transactions must be accurate |
+
+**Interview phrasing:** "For this ticketing system, I'll prioritize consistency for booking transactions but optimize for availability when users are browsing events."
+
+**Tinder example:**
+
+| Feature | Choice | Reason |
+|---------|--------|--------|
+| Match creation (both swipe right) | Consistency | Both users must see the match immediately |
+| Viewing profiles | Availability | Slightly outdated photo is acceptable |
+| Message delivery | Causal consistency | Messages must appear in order but slight delay is fine |
+
+**Interview phrasing:** "For this dating app, I'll prioritize consistency for the matching logic but optimize for availability for profile viewing."
+
+---
+
+## 6. The Consistency Spectrum
+
+### Q: Is it really just "consistent" or "eventually consistent" with nothing in between?
+
+No — there's a full spectrum. From strongest to weakest:
+
+| Model | Guarantee | Cost | Use case |
+|-------|-----------|------|----------|
+| **Strong** | All reads see the latest write, globally | Highest latency, lowest throughput | Bank balances, seat bookings |
+| **Causal** | Related events appear in correct order everywhere | Medium | Chat messages, comment threads |
+| **Read-your-own-writes** | You always see your own updates immediately | Low-Medium | Profile edits, form submissions |
+| **Eventual** | System converges over time; reads may be stale | Lowest latency, highest throughput | DNS, social feeds, CDN content |
+
+### Q: How does strong consistency work in practice?
+
+All reads reflect the most recent write, regardless of which node serves the read. The system must coordinate across nodes before responding.
+
+**Example — bank transfer:** You transfer $500 to a friend. From that moment, any query to any node (even across data centers) must reflect the new balance. The system blocks until all relevant nodes acknowledge the write.
+
+**Trade-off:** High latency (coordination overhead), lower throughput, reduced availability during partitions.
+
+**Systems:** Google Spanner, CockroachDB, DynamoDB (strong consistency mode).
+
+### Q: How does causal consistency work in practice?
+
+The system tracks dependencies between operations. If operation B was caused by operation A, then every node must see A before B. Unrelated operations have no ordering guarantee.
+
+**Example — group chat:**
+- Alice: "Should we get pizza?" (event A)
+- Bob replies to Alice: "Yes! Pepperoni please." (event B, caused by A)
+- Dave independently: "Anyone seen my keys?" (event C, unrelated)
+
+Every user is guaranteed to see Alice's message before Bob's reply. But Dave's message might appear anywhere relative to the pizza thread — before it, between them, or after — depending on the node.
+
+**Systems:** MongoDB (causal sessions), COPS.
+
+### Q: How does read-your-own-writes work in practice?
+
+After you write, your subsequent reads are guaranteed to reflect that write. Other users might see stale data temporarily.
+
+**Example — profile update:** You change your Twitter bio. You refresh — you always see the new bio. Your friend in another country might see the old bio for a few seconds until replication catches up.
+
+**Implementation:** The system tracks your last write timestamp and routes your reads to a replica that's at least as fresh as that timestamp.
+
+**Why it matters:** Without this, you submit a form → get redirected → the page reads from a stale replica → you see blank data → you panic and resubmit → duplicates.
+
+**Systems:** Facebook's TAO, most session-aware web applications.
+
+### Q: How does eventual consistency work in practice?
+
+If you stop writing, all replicas will eventually converge to the same state. No guarantees about when.
+
+**Example — DNS:** You update a domain record at 2:00 PM. At 2:01 some users resolve correctly, at 2:30 most do, at 3:00 everyone does. No coordination between DNS servers — they propagate at their own pace.
+
+**Trade-off:** Blazing fast writes, high availability, any node can accept writes — but reads may be arbitrarily stale.
+
+**Systems:** DNS, Cassandra (CL=ONE), Amazon S3 (historically), DynamoDB (default mode).
+
+---
+
+## 7. Applying CAP in System Design Interviews
+
+### Q: When in the interview should CAP come up?
+
+During **non-functional requirements** — after you've aligned on features but before you start drawing architecture. It's one of the first design decisions because it influences everything downstream: database choice, replication strategy, caching approach, and API behavior.
+
+### Q: What's the right way to frame the CAP discussion?
+
+1. State the question: "Does every read in this system need to reflect the most recent write?"
+2. Identify which features need consistency vs. availability (usually mixed)
+3. State your choice with justification
+4. Let it influence your technology choices
+
+**Example script:** "For this e-commerce system, I'd prioritize consistency for inventory and checkout — we can't oversell. But for product catalog browsing and reviews, I'd prioritize availability since showing a slightly stale review count for a few seconds is perfectly acceptable."
+
+### Q: How does the CAP choice affect your architecture?
+
+| Choice | Architecture implications |
+|--------|-------------------------|
+| **Consistency** | Synchronous replication, distributed transactions (2PC), possibly single-leader, higher latency accepted, PostgreSQL/Spanner |
+| **Availability** | Async replication, multiple read replicas, CDC pipelines, eventual consistency accepted, Cassandra/DynamoDB/Redis |
+| **Mixed (per-feature)** | Different storage backends per feature, CQRS pattern, strong consistency for writes + eventual for reads |
+
+---
+
+## Interview-Ready One-Liners
+
+### "What is CAP theorem?"
+> "In a distributed system, when a network partition occurs, you must choose between consistency — all nodes see the same data — and availability — every request gets a response. Partition tolerance is non-negotiable since networks fail."
+
+### "Why can't you have all three?"
+> "During a partition, a node either serves potentially stale data (availability) or refuses to respond until it can confirm freshness (consistency). You can't do both simultaneously."
+
+### "How do you decide between CP and AP?"
+> "Ask: would it be catastrophic if users briefly saw inconsistent data? If yes — like double-booking a seat — choose consistency. If no — like seeing a stale profile picture — choose availability."
+
+### "What about systems that need both?"
+> "Real systems use mixed consistency. Ticketmaster needs strong consistency for booking but availability for browsing. You choose per-feature, not globally."
+
+### "What's eventual consistency?"
+> "The system will converge to a consistent state if you stop writing, but there's no guarantee about when. It buys you the fastest writes and highest availability at the cost of potentially stale reads."
+
+---
+
+## Quick Reference: CAP Decision Tree
+
+```
+Designing a distributed system?
+│
+├── Does this feature involve money, bookings, or inventory?
+│   └── YES → Strong Consistency (CP)
+│       └── PostgreSQL, Spanner, DynamoDB strong mode, 2PC
+│
+├── Do users need to see their own writes immediately?
+│   └── YES → Read-your-own-writes consistency
+│       └── Session-aware routing, write-then-read from leader
+│
+├── Must related events appear in order? (chat, comments)
+│   └── YES → Causal Consistency
+│       └── MongoDB causal sessions, vector clocks
+│
+└── Is it browsing, feeds, search, or content display?
+    └── YES → Eventual Consistency (AP)
+        └── Cassandra, Redis, async replicas, CDC
+```
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| CAP theorem | A network split forces a binary choice: serve stale data or refuse to answer. |
+| Partition tolerance | Not a choice — it's gravity. Networks will fail. |
+| Strong consistency | Everyone reads from the same whiteboard, and the whiteboard is locked while someone writes. |
+| Eventual consistency | A rumor spreading through a crowd — eventually everyone hears it, but not all at once. |
+| Read-your-own-writes | You always see your own sticky notes immediately; others see them when they walk by your desk. |
+| Causal consistency | A conversation where replies always come after the message they respond to — but unrelated chats have no guaranteed order. |
+| Mixed consistency | A hospital: operating room is sterile (strong consistency), waiting room TV shows yesterday's news (eventual consistency). Same building, different standards. |
+
+---
+
+## What's Next (Recommended Topics)
+
+1. **Distributed consensus (Raft/Paxos)** — How nodes actually agree on a value when they choose consistency
+2. **Replication strategies** — Leader-follower vs. leaderless vs. multi-leader, and how each maps to CAP choices
+3. **PACELC theorem** — Extends CAP: even when there's no partition, do you trade latency for consistency?
+4. **Distributed transactions (2PC, Saga)** — Implementation patterns when you choose consistency
+5. **CRDTs and conflict resolution** — How AP systems resolve conflicting writes without coordination
+
+---
+
+*Created from a deep-dive study session on CAP theorem and consistency models. Designed for L1/L2 system design interviews — 2-4 YOE.*
