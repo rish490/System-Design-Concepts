@@ -1,0 +1,325 @@
+# Consistent Hashing — Complete Study Guide
+
+> A comprehensive Q&A guide covering the problem consistent hashing solves, how the hash ring works, virtual nodes, hot spot mitigation, data movement in practice, and real-world usage.
+> Designed for L1/L2 system design interviews — 2-4 YOE.
+
+---
+
+## Table of Contents
+
+1. [The Problem: Why Simple Modulo Hashing Fails](#1-the-problem-why-simple-modulo-hashing-fails)
+2. [How Consistent Hashing Works](#2-how-consistent-hashing-works)
+3. [Adding and Removing Nodes](#3-adding-and-removing-nodes)
+4. [Virtual Nodes](#4-virtual-nodes)
+5. [Hot Spots and Mitigation](#5-hot-spots-and-mitigation)
+6. [Data Movement in Practice](#6-data-movement-in-practice)
+7. [Real-World Systems](#7-real-world-systems)
+8. [Interview Strategy](#8-interview-strategy)
+
+---
+
+## 1. The Problem: Why Simple Modulo Hashing Fails
+
+### Q: What's the simplest way to distribute data across multiple databases, and why does it break?
+
+The simplest approach is **modulo hashing**:
+
+```
+database_id = hash(event_id) % number_of_databases
+```
+
+With 3 databases:
+- Event #1234 → `hash(1234) % 3 = 1` → Database 1
+- Event #5678 → `hash(5678) % 3 = 0` → Database 0
+- Event #9012 → `hash(9012) % 3 = 2` → Database 2
+
+It breaks the moment you change the number of databases. If you go from 3 → 4 databases, almost every key remaps to a different node. Event #1234 that lived on DB1 now computes to `hash(1234) % 4 = 0` and needs to move to DB0. This isn't isolated — the majority of your data redistributes, causing massive load spikes and downtime.
+
+### Q: What are the two scenarios where modulo hashing causes catastrophic redistribution?
+
+| Scenario | What happens |
+|----------|--------------|
+| **Adding a node** (scale out) | Modulo denominator increases. Nearly all keys remap. Massive data movement across all nodes. |
+| **Losing a node** (failure) | Modulo denominator decreases. Same catastrophic redistribution. Users experience slow responses or data unavailability during reshuffling. |
+
+In both cases, the problem is the same: changing the denominator of the modulo operation invalidates the mapping for almost every key in the system, not just the keys affected by the new/removed node.
+
+---
+
+## 2. How Consistent Hashing Works
+
+### Q: What's the core idea behind consistent hashing?
+
+Arrange both your **data** and your **servers** on a circular number line (a "hash ring"). To find where a key lives:
+
+1. Hash the key to a position on the ring
+2. Walk clockwise until you hit a server node
+
+That's it. The elegance is that adding or removing a server only affects keys in a small arc of the ring, not the entire dataset.
+
+### Q: How do you actually set up a hash ring?
+
+1. Define a hash space (typically 0 to 2^32 - 1)
+2. Place server nodes on the ring by hashing their identifiers (e.g., `hash("DB1")` → position 0, `hash("DB2")` → position 25, etc.)
+3. To assign a key, hash it and walk clockwise to the nearest server
+
+Conceptually with a simplified 0–100 ring and 4 databases at positions 0, 25, 50, 75:
+- A key hashing to position 12 → walks clockwise → lands on DB2 (position 25)
+- A key hashing to position 60 → walks clockwise → lands on DB4 (position 75)
+- A key hashing to position 80 → walks clockwise → wraps around to DB1 (position 0)
+
+### Q: Why does consistent hashing minimize data movement?
+
+Each server "owns" the arc of the ring between it and the previous server (going clockwise). When a server is added or removed, only the keys in the directly affected arc need to move. All other keys remain exactly where they are because their clockwise-nearest server hasn't changed.
+
+---
+
+## 3. Adding and Removing Nodes
+
+### Q: What happens when you add a new server to the ring?
+
+Only keys in the arc between the new server and the previous server (counter-clockwise) need to move — and they move from the server that was previously clockwise-next.
+
+**Example:** Ring with DB1(0), DB2(25), DB3(50), DB4(75). Add DB5 at position 90.
+- Only keys hashing to positions 76–90 need to move
+- They were previously owned by DB1 (the next clockwise server from 75)
+- Now they belong to DB5
+- All other keys stay put
+
+Result: ~15% of total data moves instead of ~75%+ with modulo hashing.
+
+### Q: What happens when a server goes down?
+
+Only the keys that were on the failed server need to move, and they all go to the next clockwise server.
+
+**Example:** DB2 (position 25) fails.
+- Keys at positions 1–25 were owned by DB2
+- They now map to DB3 (position 50), the next clockwise server
+- DB1, DB3, DB4 keys are completely unaffected
+
+| Operation | Modulo hashing | Consistent hashing |
+|-----------|---------------|-------------------|
+| Add 1 node to 4-node cluster | ~75% keys move | ~20% keys move (only from one neighbor) |
+| Remove 1 node from 4-node cluster | ~75% keys move | ~25% keys move (only to one neighbor) |
+
+---
+
+## 4. Virtual Nodes
+
+### Q: What problem do virtual nodes solve?
+
+Basic consistent hashing has a load imbalance problem. When a node goes down, ALL its keys transfer to a single neighbor. That neighbor now has 2x the load while others are unchanged.
+
+Similarly, with few physical nodes, the arcs on the ring can be very uneven, leading to some servers holding far more data than others.
+
+### Q: How do virtual nodes work?
+
+Instead of placing each physical server at one position on the ring, you place it at **many** positions by hashing variations of its name:
+
+```
+hash("DB1-vn1") → position 20
+hash("DB1-vn2") → position 35
+hash("DB1-vn3") → position 65
+hash("DB1-vn4") → position 88
+```
+
+All these virtual positions map back to the same physical DB1. You do this for every server, so virtual nodes from different physical servers are naturally intermixed around the ring.
+
+### Q: How do virtual nodes improve failure handling?
+
+When DB2 fails and it had virtual nodes at positions 10, 40, 70, 90:
+- Keys from "DB2-vn1" (position 10) redistribute to whichever server's virtual node is next clockwise — maybe DB3
+- Keys from "DB2-vn2" (position 40) redistribute to DB1
+- Keys from "DB2-vn3" (position 70) redistribute to DB4
+- Keys from "DB2-vn4" (position 90) redistribute to DB1
+
+The failed server's load spreads **evenly across all remaining servers** instead of dumping onto a single neighbor.
+
+### Q: How do virtual nodes help when adding a server?
+
+Without virtual nodes, a new server only takes load from its single clockwise neighbor. With virtual nodes, the new server's virtual positions are spread around the ring, absorbing small chunks of data from multiple existing nodes — giving a balanced cluster from the start.
+
+### Q: How many virtual nodes should you use?
+
+More virtual nodes = more even distribution, but more memory for the ring metadata. In practice:
+- 100–200 virtual nodes per physical server is common
+- Cassandra uses 256 tokens (virtual nodes) per node by default
+- Diminishing returns beyond a few hundred
+
+---
+
+## 5. Hot Spots and Mitigation
+
+### Q: What's the difference between structural imbalance and workload imbalance?
+
+| Type | Cause | Solution |
+|------|-------|----------|
+| **Structural imbalance** | Uneven key distribution across nodes | Virtual nodes |
+| **Workload imbalance** | Certain keys get 100x more traffic (e.g., Taylor Swift concert) | Replication, key salting, adaptive rebalancing |
+
+Consistent hashing (with virtual nodes) distributes **keys** evenly, not **traffic**. A single hot key can overwhelm a node even if the key distribution is perfect.
+
+### Q: What are the three main strategies for handling hot spots?
+
+**1. Read replicas**
+Replicate popular keys across multiple nodes. Load-balance reads among replicas. Most common approach in production.
+
+**2. Key-space salting**
+Append a random suffix to hot keys: `taylor-swift-{0..9}`. These 10 variants hash to different nodes. Reads scatter across those nodes and get aggregated by the application. Trade-off: more complex read path.
+
+**3. Adaptive rebalancing**
+Monitor traffic in real-time and move specific key ranges off overloaded nodes. Operationally complex but some systems (DynamoDB) do it automatically.
+
+### Q: What's the interview-ready distinction to make about hot spots?
+
+> "Virtual nodes prevent structural imbalance — uneven key distribution. Replication and key salting prevent workload imbalance — uneven traffic on specific keys."
+
+---
+
+## 6. Data Movement in Practice
+
+### Q: Does data actually move when a node fails in production systems?
+
+Usually **no**. Most production distributed databases use **replication alongside consistent hashing**. When a primary node fails, a replica gets promoted — no data movement required.
+
+- **DynamoDB**: Replicates each partition across 3 availability zones. Failure → replica promotion via Raft consensus.
+- **Cassandra**: Replicates data to N consecutive nodes on the ring. Surviving replicas serve reads immediately.
+
+### Q: When does data actually move in a consistent-hashing system?
+
+Data movement happens during **planned membership changes**:
+- Adding capacity (new node joins and needs to take its share)
+- Permanently replacing a node (restoring the replication factor)
+
+Even then, consistent hashing guarantees only a bounded fraction of keys need to re-replicate — not the entire dataset.
+
+### Q: What's the relationship between consistent hashing and replication?
+
+They complement each other:
+
+| Concern | Handled by |
+|---------|-----------|
+| Which node(s) should own a key? | Consistent hashing |
+| What if the owner goes down? | Replication (data already exists on other nodes) |
+| How much data moves during planned scaling? | Consistent hashing (bounds the movement) |
+| How do replicas reach consensus? | Raft, Paxos, or similar protocol |
+
+---
+
+## 7. Real-World Systems
+
+### Q: Which major systems use consistent hashing?
+
+| System | How it uses consistent hashing |
+|--------|-------------------------------|
+| **Apache Cassandra** | Distributes data across the ring. Each node owns a token range. Uses virtual nodes (vnodes) by default. |
+| **Amazon DynamoDB** | Partition placement under the hood. Combined with replication across AZs. |
+| **CDNs (Akamai, etc.)** | Determines which edge server caches specific content. Minimizes cache invalidation when servers are added/removed. |
+| **Memcached clients** | Client-side consistent hashing to distribute cache keys across a pool of memcached servers. |
+
+### Q: Do all distributed systems use consistent hashing?
+
+No. **Redis Cluster** uses a fixed hash slot approach:
+- Divides the key space into exactly 16,384 slots
+- Uses `CRC16(key) mod 16384` to assign keys to slots
+- Assigns ranges of slots to nodes
+
+| Approach | Consistent hashing | Fixed hash slots (Redis) |
+|----------|-------------------|------------------------|
+| Complexity | Moderate (ring, virtual nodes) | Simpler (just slot ranges) |
+| Rebalancing | Automatic minimal movement | Requires coordination to move slot ranges |
+| Flexibility | Elastic — nodes join/leave smoothly | More manual — resharding is explicit |
+| When to use | Large clusters, frequent scaling | Smaller clusters, infrequent topology changes |
+
+---
+
+## 8. Interview Strategy
+
+### Q: When should I go deep on consistent hashing in an interview?
+
+Go deep when asked to **design infrastructure from scratch**:
+- Design a distributed database
+- Design a distributed cache (like Memcached/Redis from scratch)
+- Design a distributed message broker
+
+Just mention it when using **existing systems**:
+- "DynamoDB uses consistent hashing under the hood for partition placement"
+- "Cassandra distributes data across the ring using consistent hashing with vnodes"
+
+### Q: What are the key points to cover when explaining consistent hashing?
+
+1. **Why** — Modulo hashing causes O(N) data movement on topology changes
+2. **How** — Hash ring, keys walk clockwise to nearest server
+3. **Virtual nodes** — Solve load imbalance by spreading each server across many ring positions
+4. **Hot spots** — Virtual nodes fix key distribution; replication/salting fix traffic distribution
+5. **Replication** — Works alongside consistent hashing; handles failures without data movement
+
+### Q: What's a common follow-up question interviewers ask?
+
+"How would you handle a hot partition?" — This tests whether you understand the distinction between even key distribution (solved by consistent hashing + vnodes) and even traffic distribution (solved by read replicas, key salting, or adaptive rebalancing).
+
+---
+
+## Interview-Ready One-Liners
+
+### "Why not just use modulo hashing?"
+> "Modulo hashing causes nearly all keys to remap when you add or remove a single node. Consistent hashing bounds the movement to only the keys in the affected arc — roughly 1/N of total data."
+
+### "How does consistent hashing work?"
+> "You place both servers and keys on a circular hash space. Each key walks clockwise to its nearest server. Adding or removing a server only disturbs keys in one arc of the ring."
+
+### "What are virtual nodes?"
+> "Instead of one ring position per server, you hash each server to many positions. This intermixes servers around the ring so when one fails, its load distributes evenly across all survivors instead of piling onto one neighbor."
+
+### "How do you handle hot keys?"
+> "Consistent hashing distributes keys evenly but not traffic. For hot keys, use read replicas to spread reads, or key salting to split one hot key into multiple keys that hash to different nodes."
+
+### "Does data move when a node fails?"
+> "In practice, no — production systems replicate data to multiple nodes. When one fails, a replica is promoted. Data movement only happens during planned scaling to restore replication factor."
+
+---
+
+## Quick Reference: Decision Tree
+
+```
+Need to distribute data across N servers?
+│
+├── Topology rarely changes, small cluster (< 10 nodes)?
+│   └── Fixed hash slots (Redis approach) — simpler to reason about
+│
+├── Topology changes frequently, elastic scaling needed?
+│   └── Consistent hashing with virtual nodes
+│       │
+│       ├── Even key distribution?     → Virtual nodes handle this
+│       ├── Even traffic distribution? → Add read replicas or key salting
+│       └── Fault tolerance?           → Combine with replication (Raft/Paxos)
+│
+└── Using a managed service (DynamoDB, Cassandra)?
+    └── Just mention it handles this under the hood — don't reinvent
+```
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| Hash ring | A clock face — keys are times, servers are hour markers. Each key belongs to whatever hour marker it hits next going clockwise. |
+| Modulo hashing failure | Changing the number of slices on a pizza — almost every topping ends up on a different slice. |
+| Virtual nodes | One person sitting at 5 different desks in an office — they get mail delivered to each desk, spreading the work. |
+| Hot spot vs. structural imbalance | Structural = desks are unevenly spaced. Hot spot = one desk gets 100 packages while others get 2. Different problems, different fixes. |
+| Replication + consistent hashing | Belt and suspenders — hashing decides where data lives, replication ensures it survives failures without moving. |
+
+---
+
+## What's Next (Recommended Topics)
+
+1. **Replication strategies** — Leader-follower, leaderless, quorum reads/writes (deepens the "what happens after hashing" story)
+2. **Partitioning strategies** — Range-based vs. hash-based partitioning trade-offs
+3. **Consensus algorithms** — Raft/Paxos (how replicas agree on who's the leader after failure)
+4. **Distributed caching** — Full design exercise that uses consistent hashing as a building block
+5. **CAP theorem and consistency models** — How consistency guarantees interact with partition placement
+
+---
+
+*Created from a deep-dive study session on consistent hashing in distributed systems. Designed for L1/L2 system design interviews — 2-4 YOE.*
