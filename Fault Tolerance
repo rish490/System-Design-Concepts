@@ -1,0 +1,353 @@
+# Load Balancing & Fault Tolerance — Complete Study Guide
+
+> A comprehensive Q&A guide covering load balancing strategies (client-side vs. dedicated), scaling approaches, timeouts and retries with backoff, idempotency, circuit breakers, and cascading failure prevention.
+> Designed for L1/L2 system design interviews — 2-4 YOE.
+
+---
+
+## Table of Contents
+
+1. [Scaling: Vertical vs. Horizontal](#1-scaling-vertical-vs-horizontal)
+2. [Load Balancing Fundamentals](#2-load-balancing-fundamentals)
+3. [Client-Side Load Balancing](#3-client-side-load-balancing)
+4. [Dedicated Load Balancers](#4-dedicated-load-balancers)
+5. [Timeouts and Retries with Backoff](#5-timeouts-and-retries-with-backoff)
+6. [Idempotency](#6-idempotency)
+7. [Circuit Breakers](#7-circuit-breakers)
+8. [Cascading Failures](#8-cascading-failures)
+
+---
+
+## 1. Scaling: Vertical vs. Horizontal
+
+### Q: What's the difference between vertical and horizontal scaling?
+
+| Approach | What it means | Analogy |
+|----------|--------------|---------|
+| **Vertical** | Bigger server (more CPU, RAM, disk) | Replacing your sedan with a truck |
+| **Horizontal** | More servers | Adding more sedans to a fleet |
+
+Vertical scaling is simpler — no coordination, no routing, no distributed systems headaches. Modern hardware is powerful enough that a single beefy machine handles more than people expect.
+
+But vertical has a ceiling (you can't buy a million-core machine), and interviews overwhelmingly focus on horizontal scaling because it introduces interesting problems: load balancing, data distribution, consistency, and failure handling.
+
+### Q: When should you prefer vertical scaling?
+
+Prefer vertical when:
+- Your workload fits on one machine (most startups)
+- You want to avoid distributed systems complexity
+- Latency matters more than throughput (single-node = no network hops)
+
+Go horizontal when:
+- You've hit the hardware ceiling
+- You need fault tolerance (one machine dying shouldn't kill the system)
+- You need geographic distribution (servers in multiple regions)
+
+---
+
+## 2. Load Balancing Fundamentals
+
+### Q: What problem does load balancing solve?
+
+You have 10 servers, but a client only knows one URL. Something needs to decide: which of those 10 servers handles this specific request? Without load balancing, all 10 servers sit idle or one gets hammered while others are empty.
+
+### Q: What are the two fundamental approaches?
+
+| Approach | Who decides? | Extra hop? | Update speed |
+|----------|-------------|-----------|--------------|
+| **Client-side** | The client picks a server from a known list | No — direct connection | Depends on polling interval or TTL |
+| **Dedicated LB** | A separate device/server routes traffic | Yes — client → LB → server | Near-instant (LB health-checks backends) |
+
+---
+
+## 3. Client-Side Load Balancing
+
+### Q: How does client-side load balancing work?
+
+The client fetches a list of available servers from a service registry, then picks one to talk to directly — no middleman. It periodically refreshes that list via polling or push notifications.
+
+**Redis Cluster example:**
+1. Client connects to any Redis node, asks for the cluster map
+2. Redis returns all nodes + which hash slots each owns
+3. Client hashes keys locally → routes to the correct node directly
+4. If wrong node: Redis replies `MOVED <correct-node>` — client updates its map
+
+**DNS example:**
+- Client resolves `api.example.com`
+- DNS returns IP addresses in rotated order each time
+- Different clients naturally hit different servers
+
+DNS is also how you make load balancers themselves not a single point of failure: register two LBs in different regions, let DNS rotate between them.
+
+### Q: When is client-side load balancing the right choice?
+
+| Scenario | Why it works | Example |
+|----------|-------------|---------|
+| Small number of clients you control | Easy to push server list updates | gRPC between internal microservices |
+| Large number of clients that tolerate slow updates | TTL-based caching distributes load | DNS (TTL = 60s, updates propagate in ~1 min) |
+
+**When it breaks:** Millions of external clients + need instant failover = can't push updates fast enough, and DNS TTL is too slow.
+
+---
+
+## 4. Dedicated Load Balancers
+
+### Q: When do you need a dedicated load balancer?
+
+Use a dedicated LB when:
+- Clients shouldn't know your internal topology (external users, mobile apps)
+- You need instant server failover (LB health-checks every few seconds)
+- You need fine-grained routing (by URL path, headers, geography, session affinity)
+- You have many clients you don't control
+
+**Trade-off:** One extra network hop per request in exchange for centralized routing control and fast failover.
+
+### Q: How do you prevent the load balancer from being a single point of failure?
+
+Layer DNS in front of multiple LBs:
+
+```
+DNS rotates between → LB1 (us-east) and LB2 (eu-west)
+LB1 routes to      → servers 1-5
+LB2 routes to      → servers 6-10
+```
+
+If LB1 dies, clients whose DNS cache expires start resolving to LB2 automatically.
+
+### Q: What's the interview cheat sheet for which to use where?
+
+| Traffic type | Best approach | Rationale |
+|-------------|--------------|-----------|
+| Internal service-to-service | Client-side (gRPC built-in, Envoy sidecar) | No extra hop, you control both sides |
+| External users → your API | Dedicated LB (ALB, Nginx, HAProxy) | Users shouldn't know your topology |
+| Making LBs fault-tolerant | DNS rotation across multiple LBs | Distributes before traffic reaches your infra |
+
+---
+
+## 5. Timeouts and Retries with Backoff
+
+### Q: Why are timeouts and retries the most basic failure-handling pattern?
+
+Networks are unreliable — requests get delayed, dropped, or hang forever. Without a timeout, a client can wait indefinitely for a response that will never come, holding resources open.
+
+The pattern:
+1. Set a timeout on every network call
+2. If it times out or fails with a transient error, retry
+3. If it still fails, back off and retry with increasing delays
+
+### Q: What is exponential backoff and why does it matter?
+
+Instead of retrying immediately (which hammers an already-struggling server), you wait progressively longer:
+
+| Attempt | Wait time (example) |
+|---------|-------------------|
+| 1st retry | 100ms |
+| 2nd retry | 200ms |
+| 3rd retry | 400ms |
+| 4th retry | 800ms |
+| 5th retry | 1600ms |
+
+Each failure doubles the wait. This gives the downstream system time to recover instead of piling on more load.
+
+### Q: What is jitter and why add it?
+
+**Jitter** = adding randomness to the backoff delay.
+
+Without jitter: 1000 clients all fail at the same time → all retry at exactly 100ms → all retry at exactly 200ms → synchronized hammering (the "thundering herd").
+
+With jitter: each client adds a random offset (e.g., retry at 100ms ± 50ms). Retries spread out over time instead of arriving as synchronized bursts.
+
+**Interview magic phrase:** "Retry with exponential backoff and jitter."
+
+### Q: What's the danger of retries without safeguards?
+
+Retries amplify load. If a service is struggling under 1000 requests/second and each client retries 3 times, the service now sees 3000 requests/second. You're making the problem worse.
+
+Solutions:
+- Exponential backoff (space out retries)
+- Jitter (de-synchronize retries)
+- Max retry cap (give up after N attempts)
+- Circuit breakers (stop retrying entirely if the service is down)
+
+---
+
+## 6. Idempotency
+
+### Q: What does idempotent mean and why does it matter for retries?
+
+An **idempotent** operation produces the same result no matter how many times you call it. Retries are safe only if the operation is idempotent.
+
+| Operation | Idempotent? | Why |
+|-----------|------------|-----|
+| `GET /user/123` | Yes | Reading doesn't change state |
+| `PUT /user/123 {name: "Alice"}` | Yes | Setting to same value repeatedly = same outcome |
+| `DELETE /user/123` | Yes | Deleting an already-deleted resource = no-op |
+| `POST /payments {amount: $10}` | **No** | Retrying charges the user $20! |
+
+### Q: How do you make non-idempotent operations safe to retry?
+
+Use an **idempotency key** — a unique identifier for each logical request. The server checks: "Have I already processed this key?"
+
+**Payment example:**
+- Client generates a UUID: `idempotency_key = "pay-abc123"`
+- Sends: `POST /payments {amount: $10, idempotency_key: "pay-abc123"}`
+- Server checks its store: already processed? → return cached result
+- Not processed? → process payment, store result keyed by `"pay-abc123"`
+- If client retries (network hiccup), server recognizes the key → returns same result, no double charge
+
+**Common idempotency key strategies:**
+- Client-generated UUID (most flexible)
+- `user_id + date` (one purchase per day)
+- `order_id + action` (one payment per order)
+
+---
+
+## 7. Circuit Breakers
+
+### Q: What problem do circuit breakers solve?
+
+When a downstream service is completely dead, retrying repeatedly is wasteful and harmful — it adds load to the dying service and makes clients wait through timeout after timeout. A circuit breaker says: "This service is clearly down. Stop trying. Fail fast."
+
+### Q: How does a circuit breaker work?
+
+Modeled after electrical circuit breakers with three states:
+
+```
+CLOSED (normal)          OPEN (tripped)           HALF-OPEN (testing)
+    │                        │                         │
+    │ failures < threshold   │ all requests            │ send ONE test request
+    │ → pass through         │ → fail immediately      │
+    │                        │                         │
+    │ failures ≥ threshold   │ after timeout period    │ test succeeds?
+    └──────── TRIP ──────────┘──── try one request ────┘──── YES → CLOSED
+                                                        └──── NO  → OPEN
+```
+
+1. **Closed** — Normal operation. Requests pass through. Monitor failure count.
+2. **Open** — Failures exceeded threshold. All requests immediately fail (no network call attempted). Fast failure, no wasted resources.
+3. **Half-open** — After a cool-down period, allow one test request through. If it succeeds → close the circuit (back to normal). If it fails → stay open.
+
+### Q: What are the concrete benefits of circuit breakers?
+
+| Benefit | Without circuit breaker | With circuit breaker |
+|---------|------------------------|---------------------|
+| Response time when service is down | Timeout (e.g., 30s) per request | Instant failure (<1ms) |
+| Load on failing service | Hammered with retries | Zero traffic (time to recover) |
+| Cascading failures | Upstream services also slow down/fail | Upstream fails fast, stays healthy |
+| Recovery | Thundering herd when service comes back | Gradual traffic ramp-up via half-open |
+
+### Q: Where should you apply circuit breakers?
+
+- External API calls to third-party services (Stripe, Twilio)
+- Database connections (especially cold-start scenarios)
+- Service-to-service calls in microservices
+- Any network call that could timeout or fail repeatedly
+
+---
+
+## 8. Cascading Failures
+
+### Q: What is a cascading failure?
+
+One service fails → its callers start timing out → their callers start timing out → the entire system collapses like dominoes. A single point of failure ripples through the dependency graph.
+
+**Classic example — "thundering herd":**
+1. Database goes down
+2. All application servers retry simultaneously
+3. Database comes back up, immediately gets slammed with 10,000 retries
+4. Database dies again under the load
+5. Repeat forever — the system can never recover
+
+### Q: How do you prevent cascading failures?
+
+| Strategy | How it helps |
+|----------|-------------|
+| **Circuit breakers** | Stop hammering dead services, give them time to recover |
+| **Exponential backoff + jitter** | De-synchronize retries so they don't arrive as a burst |
+| **Bulkheads** | Isolate resources per dependency (one slow service can't exhaust all your thread pool) |
+| **Timeouts** | Prevent slow calls from blocking threads indefinitely |
+| **Graceful degradation** | Serve partial/cached results instead of failing completely |
+| **Load shedding** | Reject excess requests early (HTTP 503) rather than trying and failing slowly |
+
+### Q: What's the interview approach when asked "what happens if this service goes down"?
+
+Walk through the failure propagation:
+1. Identify what depends on the failed service
+2. Ask: will callers retry? (Could cause thundering herd)
+3. Ask: will callers block? (Could exhaust thread pools upstream)
+4. Propose: circuit breaker + backoff + graceful degradation
+
+This shows operational maturity — exactly what interviewers look for in senior candidates.
+
+---
+
+## Interview-Ready One-Liners
+
+### "How do you handle failures in distributed systems?"
+> "Timeouts on every network call, retries with exponential backoff and jitter for transient failures, idempotency keys for safe retries on mutations, and circuit breakers to fail fast when a service is completely down."
+
+### "What's a circuit breaker?"
+> "It monitors failures to a downstream service. When failures exceed a threshold, it trips open — all requests fail immediately without attempting the call. After a cooldown, it lets one test request through to check if the service recovered."
+
+### "Why do you need idempotency keys?"
+> "Because retries can cause duplicate side effects. An idempotency key lets the server recognize a retry and return the cached result instead of processing the request again — preventing double charges, duplicate orders, etc."
+
+### "What's the thundering herd problem?"
+> "When a failed service recovers, all waiting clients retry simultaneously, overwhelming it and causing it to fail again. Backoff with jitter prevents this by spreading retries over time."
+
+### "Client-side vs. dedicated load balancer?"
+> "Client-side is faster — no extra hop — and works great for internal services you control. Dedicated LBs are for external traffic where clients shouldn't know your topology and you need instant failover."
+
+---
+
+## Quick Reference: Failure Handling Decision Tree
+
+```
+Network call failed?
+│
+├── Is it a transient error (timeout, 503, connection reset)?
+│   ├── Is the operation idempotent (or has an idempotency key)?
+│   │   └── YES → Retry with exponential backoff + jitter
+│   └── NO → Don't retry (or add an idempotency key first)
+│
+├── Have failures exceeded a threshold?
+│   └── YES → Trip the circuit breaker
+│       └── Fail fast for all requests
+│       └── After cooldown → half-open → test one request
+│
+├── Is this a critical path?
+│   ├── YES → Return error to user (with fast failure via circuit breaker)
+│   └── NO → Graceful degradation (serve cached/partial data)
+│
+└── Is the whole cluster struggling?
+    └── YES → Load shedding (reject excess requests with 503)
+```
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| Load balancer | Airport check-in desk host — assigns you to the shortest queue |
+| Client-side LB | Looking at the menu board yourself and picking the shortest line |
+| Exponential backoff | Knocking on a door: wait longer between each knock so you don't annoy them |
+| Jitter | Everyone at a concert trying to leave the parking lot — stagger exits so there's no gridlock |
+| Idempotency key | A coat-check ticket — same ticket always gets you the same coat, no matter how many times you present it |
+| Circuit breaker | Actual electrical breaker — cuts power to prevent a short from burning down the house. Resets when safe. |
+| Cascading failure | Dominoes — one falls, takes down the rest. Circuit breakers are the gaps between domino sections. |
+| Thundering herd | Everyone rushing the buffet when it opens — stagger arrival or the table collapses |
+
+---
+
+## What's Next (Recommended Topics)
+
+1. **Load balancing algorithms** — Round-robin, least connections, weighted, consistent hashing (how LBs actually pick a server)
+2. **Service mesh and sidecars** — Envoy, Istio: how modern systems handle LB + circuit breaking + retries transparently
+3. **Rate limiting** — Complementary to circuit breakers; prevents abuse from the outside
+4. **Health checks and readiness probes** — How LBs and orchestrators detect failures
+5. **Chaos engineering** — Deliberately injecting failures (Netflix Chaos Monkey) to validate resilience
+
+---
+
+*Created from a deep-dive study session on load balancing and fault tolerance in distributed systems. Designed for L1/L2 system design interviews — 2-4 YOE.*
