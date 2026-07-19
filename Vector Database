@@ -1,0 +1,355 @@
+# Vector Databases — Study Guide
+
+> Covers embeddings, similarity search, HNSW internals, filtering, writes, and DB selection. For L1/L2 system design interviews (2-4 YOE).
+
+---
+
+## 1. Vectors & Similarity Basics
+
+### Q: What is a vector/embedding and why do we need vector DBs?
+
+An embedding is an array of numbers (typically 128–1536 dims) produced by an ML model such that **similar things end up geometrically close**. SQL handles exact matches (`WHERE id = 5`) but can't answer "find similar." Vector DBs turn "meaning" into map coordinates so "similar" becomes "nearby."
+
+### Q: What defines "similar"?
+
+Whatever the embedding model was trained on. General text models capture semantic meaning (OpenAI, Sentence Transformers). Custom models can capture task-specific similarity (e.g., "bought together" for recommendations — diapers and bottles aren't conceptually similar but co-purchase models place them close).
+
+### Q: What are the common similarity metrics?
+
+| Metric | Measures | When |
+|---|---|---|
+| **Cosine similarity** | Angle between vectors (ignores magnitude) | Default for normalized text embeddings |
+| **Euclidean (L2)** | Straight-line distance | When magnitude matters (rare in modern embeddings) |
+| **Dot product** | Cosine × magnitudes | When faster to compute, vectors pre-normalized |
+| **Hamming** | Bit-differences | Binary vectors (LSH schemes) |
+
+Interview answer: "Cosine similarity or an appropriate metric" is usually sufficient.
+
+---
+
+## 2. KNN vs ANN
+
+### Q: Why can't we brute-force compare against all vectors?
+
+Exact KNN is O(n). For 1M vectors × 1536 dims, that's ~6 billion float ops per query. Doesn't scale.
+
+### Q: What's Approximate Nearest Neighbor search?
+
+Trade a little accuracy for a lot of speed. Instead of guaranteeing true top-K, find "probably the top-K, most of the time." Quality is measured by **recall** = fraction of true top-K actually returned. 95%+ recall is typical production.
+
+### Q: The three-way trade-off?
+
+| Knob | Impact |
+|---|---|
+| **Recall** | How accurate |
+| **Latency** | How fast |
+| **Memory** | RAM footprint |
+
+You tune two, sacrifice the third. Vector DBs exist to let you swap indexing algorithms without rewriting apps.
+
+---
+
+## 3. HNSW — The Default Algorithm
+
+### Q: What is HNSW at 30,000 feet?
+
+**Hierarchical Navigable Small World** — a multi-layer graph where vectors are nodes and edges connect nearby vectors. Search zooms from a sparse top layer down to the dense bottom, like Google Maps going from country view to street view.
+
+### Q: What do the layers actually do?
+
+Upper layers give Layer 0 a **good starting point**. Without them, Layer 0's search would start at a random node and waste time walking across the graph.
+
+| Layer | Role |
+|---|---|
+| Top (sparsest) | Any starting point in the index |
+| Middle | "Zoom into the right cluster" |
+| Layer 0 (all vectors) | Precision beam search returns the actual top-K |
+
+Only Layer 0 returns results. Upper layers are pure routing.
+
+### Q: How is a node's layer decided?
+
+Randomly, exponential decay: `level = floor(-ln(random()) * mL)` where `mL = 1/ln(M)`. With M=16: ~94% stay at Layer 0 only, ~6% reach Layer 1, ~0.4% Layer 2, etc. **A node exists at every layer from 0 up to its top layer.**
+
+### Q: How does insertion work?
+
+1. Assign random top layer.
+2. Descend from entry point, greedy-hopping at each upper layer.
+3. From top layer down to 0: find M nearest neighbors, create edges.
+4. If a neighbor now exceeds its edge cap, prune worst edge.
+
+Cost per insert ≈ cost of one search. That's why writes are expensive.
+
+### Q: How does search work?
+
+1. Start at entry point (top layer).
+2. At each upper layer: greedy hop to whichever neighbor is closer to query.
+3. When no neighbor improves, drop to next layer.
+4. At Layer 0: run a beam search (not greedy).
+
+### Q: Is Layer 0 brute force?
+
+**No.** It's a beam search using the graph structure. Maintains a min-heap of candidates and a max-heap of results capped at `efSearch`. Only explores nodes reachable via graph edges. Terminates when the closest unexplored candidate is worse than the worst current result.
+
+At scale: touches ~200 nodes for 1M vectors (log-scale), not 1M.
+
+---
+
+## 4. HNSW Parameters
+
+| Param | Set at | Effect | Typical |
+|---|---|---|---|
+| **M** | Build | Max edges per node (2M at Layer 0). Higher = better recall + more memory | 16 |
+| **efConstruction** | Build | Search width during index build. Higher = better graph quality | 200 |
+| **efSearch** | **Query** | Beam width at Layer 0. Higher = better recall, slower queries | 50–200 |
+
+**efSearch is the go-to knob** because it's query-time — no rebuild needed.
+
+### Q: Debugging recall/latency issues?
+
+| Symptom | First move |
+|---|---|
+| Recall too low | Raise `efSearch` |
+| Queries too slow | Lower `efSearch` |
+| Recall still low after ↑efSearch | Rebuild with higher `M` |
+| Too much RAM | Lower `M` (accept recall hit) |
+
+---
+
+## 5. Why HNSW Recall Isn't 100%
+
+### Q: What causes recall loss?
+
+HNSW is a **graph traversal heuristic**. The beam search can only reach nodes it can walk to via edges. If the true nearest neighbor isn't reachable from the entry point, it's missed — and HNSW confidently returns whatever it did find without knowing it missed.
+
+### Q: Where does the miss actually happen?
+
+| Failure | Analogy |
+|---|---|
+| Upper layers route to wrong cluster | Wrong highway exit |
+| Layer 0 beam can't reach an isolated node | No sidewalk to the coffee shop |
+| Pruning removed a bridge edge during construction | Road demolished to make room |
+| efSearch beam too narrow | Only checked one street, gave up |
+
+Vector DB answers "what's near me in the **graph**?" not "what's near me in **space**?"
+
+### Q: Can I get 100% recall?
+
+Yes, but it costs. Options: two-stage retrieval (HNSW top-1000 → brute-force re-rank), or exact KNN on GPU. Most systems settle for 95–99% because 99→100 is disproportionately expensive.
+
+---
+
+## 6. Filtering & Hybrid Search
+
+### Q: Why is filtered vector search hard?
+
+HNSW doesn't know about your filter columns. Two flawed options:
+
+| Approach | Works when | Fails when |
+|---|---|---|
+| **Post-filter** (search then filter) | Filter is loose (>50% survives) | Filter is strict — might not get K results |
+| **Pre-filter** (filter then search) | Filter is very selective (<1%) — brute-force the subset | Middle-selectivity filters — HNSW index unusable on arbitrary subset |
+
+Middle-selectivity is where DBs differ.
+
+### Q: How do the big DBs handle filtering?
+
+| DB | Approach |
+|---|---|
+| **pgvector** | Planner picks vector index OR filter index — either/or, no filtered HNSW |
+| **Elasticsearch** | Applies filter **during** HNSW traversal — guaranteed K results, slower for strict filters |
+| **Pinecone** | Inverted indexes on metadata, intersected with vector search in one op |
+
+### Q: What is hybrid search?
+
+**Keyword search (BM25) + vector search**, merged. Query "red running shoes" uses keyword for "red" and vector for semantic breadth. Common ranking function: reciprocal rank fusion. Different from filtered search.
+
+---
+
+## 7. Writes & Index Maintenance
+
+### Q: Are vector DBs read-heavy?
+
+**Yes.** Typical read:write ratio is 100:1 to 10,000:1. HNSW build is expensive; graph degrades with continuous writes. Vector DBs assume "write occasionally, read millions of times."
+
+### Q: How do production systems handle writes?
+
+**Hot/cold index pattern:**
+
+```
+Query
+  ├──> HOT: small index or flat list of recent writes (brute-force OK)
+  └──> COLD: big HNSW, rebuilt periodically
+  → Merge results
+```
+
+Hot merges into cold periodically via full rebuild.
+
+### Q: How are deletes handled?
+
+**Soft deletes** — mark as deleted, filter at query time. Actually removing would require rewiring graph edges. Deleted vectors keep taking space until next rebuild.
+
+### Q: How long do rebuilds take?
+
+| Vector count | Build time |
+|---|---|
+| 100K | Seconds |
+| 1M | Minutes |
+| 10M | ~1 hour |
+| 100M+ | Many hours |
+
+Survival strategies: rolling rebuild (build new alongside old, swap), partitioned index, background reindex.
+
+---
+
+## 8. Which Vector DB to Pick
+
+### Q: Golden rule?
+
+**Start with an extension to a DB you already run.** Purpose-built vector DBs only when scale demands it (~100M+ vectors).
+
+### Q: Tier 1 — Extensions
+
+| Option | When |
+|---|---|
+| **pgvector** | Already on Postgres. ACID, JOINs, familiar tooling. Handles millions easily. |
+| **Elasticsearch kNN** | Already on ES. Best-in-class hybrid search. |
+| **Redis Vector** | Need low-latency real-time, Redis already in stack |
+| **S3 Vector** | Cold data, already on AWS |
+
+### Q: Tier 2 — Purpose-built (>100M vectors)
+
+| Option | Vibe |
+|---|---|
+| **Pinecone** | Fully managed, easiest to operate, most expensive |
+| **Weaviate** | Open source, GraphQL API, good hybrid search |
+| **Milvus** | Built for billions of vectors, distributed = complex |
+| **Qdrant** | Rust, excellent filtering — pick if filters are central |
+| **Chroma** | Lightweight, RAG prototyping only |
+
+---
+
+## 9. Interview Playbook
+
+### Q: When do vector DBs come up?
+
+Almost always AI/ML-adjacent — you'll know in advance. Common patterns:
+
+| Question | Vector DB role |
+|---|---|
+| Semantic search / doc search | Embed docs, search on query |
+| Recommendations | Embed items & users, find similar |
+| Reverse image search | CLIP embeddings, similarity search |
+| RAG / knowledge Q&A | Retrieve docs, LLM synthesizes |
+| Near-duplicate / dedup | Embed items, threshold match |
+| Fraud/anomaly detection | Embed transactions, find outliers |
+
+### Q: Default architecture pattern to whiteboard?
+
+```
+[Client Query]
+    │
+    ▼
+[Embedding Service] → generate query vector
+    │
+    ▼
+[Vector DB] → return top-K IDs
+    │
+    ▼
+[Primary DB] → fetch full item details
+    │
+    ▼
+[Response]
+```
+
+Vector DB is a **specialized index**, not the source of truth.
+
+### Q: Numbers to know
+
+| Metric | Value |
+|---|---|
+| Typical embedding dims | 128–1536 (OpenAI = 1536) |
+| Memory per vector | 4 bytes × dims (1536 dims ≈ 6KB) |
+| 1M vectors @ 1536 dims | ~6GB raw, ~12GB with HNSW |
+| Query latency (tuned) | 1–10ms |
+| Recall target | 95%+ typical, 99%+ expensive |
+| Throughput | 10Ks QPS per node (in-memory) |
+| Threshold for purpose-built DB | ~100M vectors |
+
+---
+
+## Interview One-Liners
+
+### "How does the vector DB find similar items fast?"
+> "HNSW — a multi-layer graph where vectors are nodes and edges connect nearby vectors. Search starts sparse at the top layer, greedily navigates toward the target, and drops to denser layers as it converges. Skip lists, but for high-dimensional space."
+
+### "What similarity metric would you use?"
+> "Cosine similarity — most text embeddings are normalized so we just care about direction, not magnitude."
+
+### "Why isn't HNSW 100% accurate?"
+> "It's a graph traversal — can only reach nodes connected by edges. If the true nearest neighbor isn't reachable from where we entered, we miss it silently. That's the recall trade-off."
+
+### "How do you handle filters like 'in stock' or 'in region'?"
+> "Depends on selectivity — pre-filter and brute-force for very selective filters, post-filter for loose ones. I'd benchmark with real data."
+
+### "How do you handle writes?"
+> "Vector DBs are read-heavy. I'd use a hot/cold pattern — small hot index for recent writes, big HNSW rebuilt nightly. Queries hit both and merge."
+
+### "Which vector DB would you pick?"
+> "Start with pgvector if we're on Postgres, or ES kNN if we already run Elasticsearch. Purpose-built like Pinecone or Milvus only if we're past 100M vectors."
+
+### "What about consistency?"
+> "Vector search can be eventually consistent — new items don't need to be immediately searchable."
+
+---
+
+## Decision Cheat Sheet
+
+```
+Problem: "Find similar items fast"
+    │
+    ├── < 100M vectors AND already on Postgres  → pgvector
+    ├── < 100M vectors AND already on ES        → ES kNN
+    ├── < 100M vectors AND need low-latency     → Redis Vector
+    ├── > 100M vectors AND want managed         → Pinecone
+    ├── > 100M vectors AND complex filtering    → Qdrant
+    ├── > 1B vectors AND ok with ops complexity → Milvus
+    └── Prototyping RAG                         → Chroma
+
+Recall too low?  → ↑ efSearch (no rebuild) → ↑ M (rebuild)
+Latency too high? → ↓ efSearch
+Filter is strict? → pre-filter + brute force
+Filter is loose?  → post-filter
+Writes constant?  → hot/cold pattern
+```
+
+---
+
+## Mental Models
+
+| Concept | Analogy |
+|---|---|
+| Embedding | GPS coordinate for meaning |
+| Vector DB | Phone book — expensive to compile, cheap to look up |
+| HNSW layers | Google Maps zoom levels (country → city → street) |
+| Layer 0 beam search | Wavefront spreading through a road network |
+| efSearch | Size of your apartment-hunting shortlist |
+| M parameter | Roads leaving each town — more roads = more paths |
+| Recall loss | Best pizza place has no road connecting to your hotel |
+| Hot/cold index | Newspaper daily edits + weekend reprint |
+| Vector DB role in architecture | An index, never the source of truth |
+| Hybrid search | Google combining exact keywords + semantic meaning |
+
+---
+
+## What's Next
+
+- **IVF and LSH** — alternative indexing algorithms (when HNSW isn't the right fit)
+- **Product Quantization (PQ)** — compress vectors to shrink memory 10x with modest recall loss
+- **Two-stage retrieval + rerankers** — the pattern used by YouTube/TikTok recommenders
+- **Embedding model selection** — dims, latency, and cost trade-offs
+- **RAG system design end-to-end** — putting vector search in a full LLM app
+
+---
+
+*Vector database fundamentals for system design interviews.*
